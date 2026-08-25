@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+*.egg
+.coverage
+
+# Go
+wags/go/wags.exe
+wags/go/.wags/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor swap/backup files
+*.swp
+*~
+
+# IDE configs
+.idea/
+
+# Credentials and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key

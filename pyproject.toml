@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wags"
+version = "0.1.0"
+description = "Lightweight, polyglot, air-gappable multi-agent peer review protocol. Stdlib-only Python + Go reference implementations."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [
+    {name = "Reuben Bowlby", email = "reuben@hummbl.io"},
+    {name = "HUMMBL, LLC"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Go",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Security :: Cryptography",
+]
+keywords = ["peer-review", "multi-agent", "air-gapped", "polyglot", "tamper-evident", "hash-chaining", "consensus", "audit"]
+dependencies = []
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hummbl-io/wags"
+Documentation = "https://github.com/hummbl-io/wags/blob/main/docs/wags-protocol.md"
+Issues = "https://github.com/hummbl-io/wags/issues"
+
+[tool.setuptools]
+packages = ["wags"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
