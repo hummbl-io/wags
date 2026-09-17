@@ -5,10 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
 
 jobs:
   analyze:
     name: Analyze
+    # GitHub-hosted compute unavailable for private org; fleet policy
+    # is self-hosted Linux.
     runs-on: [self-hosted, Linux]
     permissions:
       actions: read
@@ -20,6 +24,9 @@ jobs:
       matrix:
         language: [python]
 
+    # GHAS disabled 2026-09-16: SARIF upload requires Code Security on
+    # private repos. Skipped until org/repo var HUMMBL_GHAS_ENABLED=true.
+    if: vars.HUMMBL_GHAS_ENABLED == 'true'
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
