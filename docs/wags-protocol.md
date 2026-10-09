@@ -1,4 +1,4 @@
-# wags Protocol Specification (v0.1.0)
+# wags Protocol Specification (v0.2.0)
 
 **Status:** DRAFT / PROPOSED  
 **Author:** Multi-Agent Collective (`devin`, `gemini`, `operator`)  
@@ -43,7 +43,7 @@ A review workspace is structured under a root directory (default: `.wags/` or sp
 ### 3.1 Target Manifest (`target.json`)
 ```json
 {
-  "protocol_version": "0.1.0",
+  "protocol_version": "0.2.0",
   "review_id": "rev-20260823-7f8a9b",
   "created_at": "2026-08-23T23:55:00Z",
   "initiator": "gemini",
@@ -88,7 +88,7 @@ Each line is a JSON object with cryptographic chaining:
 ### 3.3 Convergence Manifest (`converged.json`)
 ```json
 {
-  "protocol_version": "0.1.0",
+  "protocol_version": "0.2.0",
   "review_id": "rev-20260823-7f8a9b",
   "converged_at": "2026-08-23T23:58:30Z",
   "target_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -109,7 +109,9 @@ Each line is a JSON object with cryptographic chaining:
       "N": 0
     }
   },
-  "blocking_findings": []
+  "blocking_findings": [],
+  "open_findings": [],
+  "resolved_findings": []
 }
 ```
 
@@ -124,11 +126,37 @@ Each line is a JSON object with cryptographic chaining:
 - **`P3` (Nit / Polish)**: Minor cosmetic or phrasing suggestion.
 - **`N` (Note / Praise)**: Positive verification or context observation.
 
-### 4.2 Consensus Decision Rules
-1. **P0 Rule (Absolute Veto)**: If any active reviewer submits a verified `P0` finding with a `block` verdict, the overall review verdict is **`BLOCK`**.
-2. **P1 Rule**: If any active reviewer has unresolved `P1` findings and votes `request_changes`, the overall verdict is **`REQUEST_CHANGES`**.
-3. **Majority Approval**: If there are zero `P0` and zero `P1` blockers, and $\ge 50\%$ of participating reviewers submit `approve`, the verdict is **`APPROVE`**.
-4. **Tie / Inconclusive**: If no quorum or tied without consensus, the review defaults to **`DEFER`** pending operator intervention.
+### 4.2 Consensus Decision Rules (protocol 0.2.0)
+Convergence is computed **per reviewer stream**, in append order:
+
+- **Latest verdict wins.** A reviewer's vote is the `verdict` of their most recent entry that has one. Earlier verdicts are history, not votes.
+- **Only open findings count.** A finding is *open* unless a **later entry in the same reviewer's stream** resolves it (see 4.3). Resolved findings stay in the log and are reported in `converged.json` under `resolved_findings`; `findings_by_severity` counts open findings only.
+
+Rules, in order:
+1. **P0 Rule (Absolute Veto)**: Any **open** `P0` finding, or any reviewer whose latest verdict is `block`, makes the overall verdict **`BLOCK`**. An approving reviewer cannot veto-proof their own open P0; they must resolve it explicitly.
+2. **P1 Rule**: Any reviewer whose latest verdict is `request_changes`, or any **open** `P1` whose reviewer's latest verdict is not `approve`, makes the verdict **`REQUEST_CHANGES`**. (An open P1 from a reviewer whose latest verdict is `approve` is reported in `open_findings` but does not block.)
+3. **Majority Approval**: If there are no blockers and $\ge 50\%$ of reviewers with a verdict submit `approve`, the verdict is **`APPROVE`**.
+4. **Tie / Inconclusive**: Otherwise **`DEFER`** pending operator intervention.
+
+### 4.3 Resolving and Superseding Findings
+An entry MAY carry, inside `metadata` (which is already covered by `entry_hash`, so the hash format is unchanged):
+
+```json
+"metadata": {
+  "resolves":   ["mtsmu-P1-01", "mtsmu-P1-02"],
+  "supersedes": ["a3ec45df030df633...ee6b"]
+}
+```
+
+- `resolves`: list of finding `id`s. Each MUST appear in an **earlier entry of the same reviewer's stream**.
+- `supersedes`: list of `entry_hash` values. Each MUST be an **earlier entry of the same reviewer's stream**; all findings raised in those entries become resolved.
+- A reviewer can never resolve another reviewer's findings. Implementations MUST reject such refs at submit time, and `verify` MUST mark a stream containing invalid refs as invalid. Convergence ignores invalid refs.
+- Entries are never rewritten; resolution is purely additive, preserving append-only and hash-chain guarantees.
+
+**Backward compatibility:** logs written by 0.1.0 (no `resolves`/`supersedes`) verify unchanged and converge with the latest-verdict rule. Ad-hoc metadata keys (e.g. `resolved_findings`) carry no protocol meaning.
+
+### 4.4 Canonical JSON
+Entry hashes are SHA-256 over JSON with sorted keys, separators `,` and `:`, UTF-8, non-ASCII emitted raw, and **no HTML escaping** (`<`, `>`, `&` emitted literally), matching Python `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
 
 ---
 

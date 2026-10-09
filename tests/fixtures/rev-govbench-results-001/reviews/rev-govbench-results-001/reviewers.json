@@ -1,0 +1,17 @@
+{
+  "hugging-face": {
+    "registered_at": "2026-10-09T21:53:55.805163Z",
+    "role": "initiator",
+    "has_hmac": false
+  },
+  "parallax-mtsmu": {
+    "registered_at": "2026-10-09T23:14:17.225674Z",
+    "role": "reviewer",
+    "has_hmac": false
+  },
+  "parallax-quilter": {
+    "registered_at": "2026-10-09T23:14:18.357249Z",
+    "role": "reviewer",
+    "has_hmac": false
+  }
+}

@@ -1,8 +1,9 @@
-// Package main implements wags v0.1.0 - polyglot air-gappable multi-agent peer review protocol.
+// Package main implements wags v0.2.0 - polyglot air-gappable multi-agent peer review protocol.
 // 100% Go standard library (zero external dependencies).
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	ProtocolVersion = "0.1.0"
+	ProtocolVersion = "0.2.0"
 	GenesisHash     = "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
@@ -50,6 +51,21 @@ func computeSHA256(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+// canonicalJSON matches Python json.dumps(sort_keys=True, separators=(",", ":"),
+// ensure_ascii=False): no HTML escaping of <, >, & and raw U+2028/U+2029.
+func canonicalJSON(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	out := buf.Bytes()
+	out = out[:len(out)-1] // drop trailing newline added by Encode
+	out = []byte(strings.NewReplacer(`\u2028`, "\u2028", `\u2029`, "\u2029").Replace(string(out)))
+	return out, nil
+}
+
 func computeEntryHash(entry *StreamEntry) (string, error) {
 	payload := map[string]interface{}{
 		"sequence":    entry.Sequence,
@@ -76,7 +92,7 @@ func computeEntryHash(entry *StreamEntry) (string, error) {
 		payload["findings"] = []map[string]interface{}{}
 	}
 
-	bytes, err := json.Marshal(payload)
+	bytes, err := canonicalJSON(payload)
 	if err != nil {
 		return "", err
 	}
@@ -222,6 +238,13 @@ func (ws *WagsWorkspace) RegisterReviewer(reviewID, reviewerName, secretKey, rol
 }
 
 func (ws *WagsWorkspace) SubmitEntry(reviewID, reviewerName, phase string, findings []Finding, verdict string, secretKey string) (*StreamEntry, error) {
+	return ws.SubmitEntryWithMetadata(reviewID, reviewerName, phase, findings, verdict, secretKey, nil)
+}
+
+// SubmitEntryWithMetadata appends an entry with optional metadata. If metadata
+// carries "resolves" or "supersedes", the refs are validated against the
+// reviewer's own earlier entries before anything is written.
+func (ws *WagsWorkspace) SubmitEntryWithMetadata(reviewID, reviewerName, phase string, findings []Finding, verdict string, secretKey string, metadata map[string]interface{}) (*StreamEntry, error) {
 	revDir := filepath.Join(ws.ReviewsDir, reviewID)
 	streamPath := filepath.Join(revDir, reviewerName+".jsonl")
 
@@ -243,6 +266,16 @@ func (ws *WagsWorkspace) SubmitEntry(reviewID, reviewerName, phase string, findi
 					lastHash = prev.EntryHash
 				}
 			}
+		}
+	}
+
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	if _, ok := metadata["resolves"]; ok || metadata["supersedes"] != nil {
+		prior, _ := readStream(streamPath)
+		if errs := checkResolutionRefs(prior, metadata); len(errs) > 0 {
+			return nil, fmt.Errorf("%s", strings.Join(errs, "; "))
 		}
 	}
 
@@ -268,7 +301,7 @@ func (ws *WagsWorkspace) SubmitEntry(reviewID, reviewerName, phase string, findi
 		PrevHash:  lastHash,
 		Findings:  findingsMaps,
 		Verdict:   verdict,
-		Metadata:  map[string]interface{}{},
+		Metadata:  metadata,
 	}
 	if entry.Findings == nil {
 		entry.Findings = []map[string]interface{}{}
@@ -355,6 +388,7 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 		}
 		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 		expectedPrev := GenesisHash
+		var prior []StreamEntry
 
 		for idx, line := range lines {
 			if strings.TrimSpace(line) == "" {
@@ -379,12 +413,138 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 				valid = false
 				errorsList = append(errorsList, fmt.Sprintf("%s line %d: %s", reviewer, idx+1, msg))
 			}
+			for _, m := range checkResolutionRefs(prior, entry.Metadata) {
+				valid = false
+				errorsList = append(errorsList, fmt.Sprintf("%s line %d: %s", reviewer, idx+1, m))
+			}
+			prior = append(prior, entry)
 			expectedPrev = entry.EntryHash
 		}
 	}
 	return valid, errorsList, nil
 }
 
+// readStream reads one reviewer stream in file (append) order.
+func readStream(path string) ([]StreamEntry, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []StreamEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var e StreamEntry
+		if err := json.Unmarshal([]byte(line), &e); err == nil {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// stringList extracts a []string from a metadata value; ok=false if malformed.
+func stringList(v interface{}) ([]string, bool) {
+	if v == nil {
+		return nil, true
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		if sa, ok2 := v.([]string); ok2 {
+			return sa, true
+		}
+		return nil, false
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		s, ok := x.(string)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, s)
+	}
+	return out, true
+}
+
+// checkResolutionRefs validates metadata.resolves / metadata.supersedes against
+// the reviewer's OWN earlier entries. Mirrors Python _check_resolution_refs.
+func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []string {
+	var errs []string
+	if md == nil {
+		return nil
+	}
+	ids := map[string]bool{}
+	hashes := map[string]bool{}
+	for _, e := range prior {
+		hashes[e.EntryHash] = true
+		for _, f := range e.Findings {
+			if id, ok := f["id"].(string); ok {
+				ids[id] = true
+			}
+		}
+	}
+	if res, ok := stringList(md["resolves"]); !ok {
+		errs = append(errs, "metadata.resolves must be a list of finding id strings")
+	} else {
+		for _, id := range res {
+			if !ids[id] {
+				errs = append(errs, fmt.Sprintf("metadata.resolves references unknown finding '%s' (not in this reviewer's earlier entries)", id))
+			}
+		}
+	}
+	if sup, ok := stringList(md["supersedes"]); !ok {
+		errs = append(errs, "metadata.supersedes must be a list of entry_hash strings")
+	} else {
+		for _, h := range sup {
+			if !hashes[h] {
+				errs = append(errs, fmt.Sprintf("metadata.supersedes references unknown entry '%s' (not an earlier entry in this reviewer's stream)", h))
+			}
+		}
+	}
+	return errs
+}
+
+// streamState returns latest verdict, open findings, resolved findings.
+func streamState(entries []StreamEntry) (string, []map[string]interface{}, []map[string]interface{}) {
+	latest := ""
+	resolvedIDs := map[string]bool{}
+	supHashes := map[string]bool{}
+	type raisedF struct {
+		hash string
+		f    map[string]interface{}
+	}
+	var raised []raisedF
+	for idx, e := range entries {
+		if len(checkResolutionRefs(entries[:idx], e.Metadata)) == 0 && e.Metadata != nil {
+			res, _ := stringList(e.Metadata["resolves"])
+			sup, _ := stringList(e.Metadata["supersedes"])
+			for _, id := range res {
+				resolvedIDs[id] = true
+			}
+			for _, h := range sup {
+				supHashes[h] = true
+			}
+		}
+		if e.Verdict != "" {
+			latest = e.Verdict
+		}
+		for _, f := range e.Findings {
+			raised = append(raised, raisedF{e.EntryHash, f})
+		}
+	}
+	var open, resolved []map[string]interface{}
+	for _, r := range raised {
+		id, _ := r.f["id"].(string)
+		if resolvedIDs[id] || supHashes[r.hash] {
+			resolved = append(resolved, r.f)
+		} else {
+			open = append(open, r.f)
+		}
+	}
+	return latest, open, resolved
+}
+
+// ConvergeReview: latest verdict per reviewer + open findings only (protocol 0.2.0).
 func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}, error) {
 	revDir := filepath.Join(ws.ReviewsDir, reviewID)
 	targetBytes, err := os.ReadFile(filepath.Join(revDir, "target.json"))
@@ -394,23 +554,39 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	var targetManifest map[string]interface{}
 	_ = json.Unmarshal(targetBytes, &targetManifest)
 
-	entries, err := ws.TailReview(reviewID)
+	matches, err := filepath.Glob(filepath.Join(revDir, "*.jsonl"))
 	if err != nil {
 		return nil, err
 	}
+	sort.Strings(matches)
 
 	reviewerVerdicts := map[string]string{}
 	severityCounts := map[string]int{"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
-	var blockingFindings []map[string]interface{}
+	blockingFindings := []map[string]interface{}{}
+	openFindings := []map[string]interface{}{}
+	resolvedFindings := []map[string]interface{}{}
+	openP0, blockingP1 := 0, 0
 
-	for _, entry := range entries {
-		if entry.Verdict != "" {
-			reviewerVerdicts[entry.Reviewer] = entry.Verdict
+	for _, m := range matches {
+		reviewer := strings.TrimSuffix(filepath.Base(m), ".jsonl")
+		entries, err := readStream(m)
+		if err != nil {
+			continue
 		}
-		for _, f := range entry.Findings {
+		latest, open, resolved := streamState(entries)
+		if latest != "" {
+			reviewerVerdicts[reviewer] = latest
+		}
+		resolvedFindings = append(resolvedFindings, resolved...)
+		for _, f := range open {
+			openFindings = append(openFindings, f)
 			sev := strings.ToUpper(fmt.Sprintf("%v", f["severity"]))
 			severityCounts[sev]++
-			if sev == "P0" || (sev == "P1" && entry.Verdict == "block") {
+			if sev == "P0" {
+				openP0++
+				blockingFindings = append(blockingFindings, f)
+			} else if sev == "P1" && strings.ToLower(latest) != "approve" {
+				blockingP1++
 				blockingFindings = append(blockingFindings, f)
 			}
 		}
@@ -419,38 +595,39 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	totalReviewers := len(reviewerVerdicts)
 	verdictCounts := map[string]int{"approve": 0, "request_changes": 0, "block": 0, "defer": 0}
 	for _, v := range reviewerVerdicts {
-		nv := strings.ToLower(v)
-		verdictCounts[nv]++
+		verdictCounts[strings.ToLower(v)]++
 	}
 
 	overallVerdict := "DEFER"
 	rationale := "Insufficient quorum or inconclusive vote."
 
-	if severityCounts["P0"] > 0 || verdictCounts["block"] > 0 {
+	if openP0 > 0 || verdictCounts["block"] > 0 {
 		overallVerdict = "BLOCK"
-		rationale = fmt.Sprintf("Blocked by %d P0 critical finding(s) or explicit block vote.", severityCounts["P0"])
-	} else if severityCounts["P1"] > 0 || verdictCounts["request_changes"] > 0 {
+		rationale = fmt.Sprintf("Blocked by %d open P0 finding(s) or explicit block vote.", openP0)
+	} else if blockingP1 > 0 || verdictCounts["request_changes"] > 0 {
 		overallVerdict = "REQUEST_CHANGES"
-		rationale = fmt.Sprintf("Changes required: %d P1 finding(s) or request_changes vote(s).", severityCounts["P1"])
+		rationale = fmt.Sprintf("Changes required: %d blocking open P1 finding(s) or request_changes vote(s).", blockingP1)
 	} else if totalReviewers > 0 && float64(verdictCounts["approve"]) >= (float64(totalReviewers)/2.0) {
 		overallVerdict = "APPROVE"
 		rationale = fmt.Sprintf("Approved by majority (%d/%d) with 0 blockers.", verdictCounts["approve"], totalReviewers)
 	}
 
 	converged := map[string]interface{}{
-		"protocol_version":  ProtocolVersion,
-		"review_id":         reviewID,
-		"converged_at":      time.Now().UTC().Format(time.RFC3339),
-		"target":            targetManifest["target"],
-		"overall_verdict":   overallVerdict,
-		"rationale":         rationale,
-		"quorum_met":        totalReviewers > 0,
+		"protocol_version": ProtocolVersion,
+		"review_id":        reviewID,
+		"converged_at":     time.Now().UTC().Format(time.RFC3339),
+		"target":           targetManifest["target"],
+		"overall_verdict":  overallVerdict,
+		"rationale":        rationale,
+		"quorum_met":       totalReviewers > 0,
 		"summary": map[string]interface{}{
 			"total_reviewers":      totalReviewers,
 			"verdicts":             verdictCounts,
 			"findings_by_severity": severityCounts,
 		},
 		"blocking_findings": blockingFindings,
+		"open_findings":     openFindings,
+		"resolved_findings": resolvedFindings,
 	}
 
 	data, _ := json.MarshalIndent(converged, "", "  ")

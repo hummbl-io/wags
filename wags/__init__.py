@@ -1,6 +1,6 @@
 """wags - Lightweight, polyglot, air-gappable multi-agent peer review protocol engine.
 
-Reference Implementation (v0.1.0)
+Reference Implementation (v0.2.0)
 Stdlib-only: zero third-party runtime dependencies.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-PROTOCOL_VERSION = "0.1.0"
+PROTOCOL_VERSION = "0.2.0"
 GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
 
 
@@ -256,10 +256,19 @@ class WagsWorkspace:
         rebuttal_to: Optional[str] = None,
         secret_key: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        resolves: Optional[List[str]] = None,
+        supersedes: Optional[List[str]] = None,
     ) -> StreamEntry:
         rev_dir = self.reviews_dir / review_id
         if not rev_dir.exists():
             raise ValueError(f"Review {review_id} not found")
+
+        if resolves is not None or supersedes is not None:
+            metadata = dict(metadata or {})
+            if resolves is not None:
+                metadata["resolves"] = list(resolves)
+            if supersedes is not None:
+                metadata["supersedes"] = list(supersedes)
 
         findings_dicts: List[Dict[str, Any]] = []
         if findings:
@@ -268,6 +277,14 @@ class WagsWorkspace:
                     findings_dicts.append(item.to_dict())
                 elif isinstance(item, dict):
                     findings_dicts.append(item)
+
+        md = metadata or {}
+        if "resolves" in md or "supersedes" in md:
+            stream_path = rev_dir / f"{reviewer_name}.jsonl"
+            prior = self._read_stream_dicts(stream_path) if stream_path.exists() else []
+            errs = self._check_resolution_refs(prior, md.get("resolves", []), md.get("supersedes", []))
+            if errs:
+                raise ValueError("; ".join(errs))
 
         last_seq, prev_hash = self._get_reviewer_last_entry(review_id, reviewer_name)
         new_seq = last_seq + 1
@@ -343,6 +360,7 @@ class WagsWorkspace:
             stream_valid = True
             errors = []
             expected_prev = GENESIS_HASH
+            prior_dicts: List[Dict[str, Any]] = []
 
             with open(path, "r", encoding="utf-8") as f:
                 for idx, line in enumerate(f, start=1):
@@ -380,6 +398,13 @@ class WagsWorkspace:
                             stream_valid = False
                             errors.append(f"Line {idx} sequence {entry.sequence}: {msg}")
 
+                        # Validate resolution refs (own stream, earlier entries only)
+                        res, sup = self._resolution_refs(d)
+                        for msg2 in self._check_resolution_refs(prior_dicts, res, sup):
+                            stream_valid = False
+                            errors.append(f"Line {idx} sequence {entry.sequence}: {msg2}")
+                        prior_dicts.append(d)
+
                         expected_prev = entry.entry_hash
                     except Exception as ex:
                         stream_valid = False
@@ -394,8 +419,93 @@ class WagsWorkspace:
 
         return results
 
+    # ------------------------------------------------------------------
+    # Finding resolution (protocol 0.2.0)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_stream_dicts(path: Path) -> List[Dict[str, Any]]:
+        """Read a reviewer stream in file (append) order."""
+        out: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+        return out
+
+    @staticmethod
+    def _resolution_refs(d: Dict[str, Any]) -> Tuple[Any, Any]:
+        md = d.get("metadata") or {}
+        if not isinstance(md, dict):
+            return [], []
+        return md.get("resolves", []), md.get("supersedes", [])
+
+    @staticmethod
+    def _check_resolution_refs(
+        prior: List[Dict[str, Any]], resolves: Any, supersedes: Any
+    ) -> List[str]:
+        """Validate resolves/supersedes against the reviewer's OWN earlier entries."""
+        errors: List[str] = []
+        prior_ids = {f.get("id") for e in prior for f in e.get("findings", []) if isinstance(f, dict)}
+        prior_hashes = {e.get("entry_hash") for e in prior}
+        if not isinstance(resolves, list) or not all(isinstance(x, str) for x in resolves):
+            errors.append("metadata.resolves must be a list of finding id strings")
+        else:
+            for fid in resolves:
+                if fid not in prior_ids:
+                    errors.append(f"metadata.resolves references unknown finding '{fid}' (not in this reviewer's earlier entries)")
+        if not isinstance(supersedes, list) or not all(isinstance(x, str) for x in supersedes):
+            errors.append("metadata.supersedes must be a list of entry_hash strings")
+        else:
+            for h in supersedes:
+                if h not in prior_hashes:
+                    errors.append(f"metadata.supersedes references unknown entry '{h}' (not an earlier entry in this reviewer's stream)")
+        return errors
+
+    @classmethod
+    def _stream_state(cls, entries: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Return (latest_verdict, open_findings, resolved_findings) for one stream.
+
+        Rule: a finding is open unless a LATER entry in the same stream lists
+        its id in ``metadata.resolves`` or lists the hash of the entry that
+        raised it in ``metadata.supersedes``. Invalid refs are ignored here
+        (verify_review reports them).
+        """
+        latest_verdict: Optional[str] = None
+        raised: List[Tuple[str, Dict[str, Any]]] = []  # (entry_hash, finding)
+        resolved_ids: set = set()
+        superseded_hashes: set = set()
+        for idx, d in enumerate(entries):
+            resolves, supersedes = cls._resolution_refs(d)
+            if not cls._check_resolution_refs(entries[:idx], resolves, supersedes):
+                resolved_ids.update(resolves)
+                superseded_hashes.update(supersedes)
+            if d.get("verdict"):
+                latest_verdict = d["verdict"]
+            for finding in d.get("findings", []):
+                raised.append((d.get("entry_hash", ""), finding))
+        open_f, resolved_f = [], []
+        for h, finding in raised:
+            if finding.get("id") in resolved_ids or h in superseded_hashes:
+                resolved_f.append(finding)
+            else:
+                open_f.append(finding)
+        return latest_verdict, open_f, resolved_f
+
     def converge_review(self, review_id: str) -> Dict[str, Any]:
-        """Compute final consensus verdict using P0-Veto + Majority Approval rules."""
+        """Compute consensus using each reviewer's latest verdict and open findings.
+
+        - Verdict per reviewer = verdict of their latest entry that has one.
+        - Only OPEN findings count (see ``_stream_state``).
+        - BLOCK if any open P0 or any latest ``block`` vote.
+        - REQUEST_CHANGES if any latest ``request_changes`` vote, or any open
+          P1 whose reviewer's latest verdict is not ``approve``.
+        - Otherwise APPROVE on >= 50% approve, else DEFER.
+        """
         rev_dir = self.reviews_dir / review_id
         if not rev_dir.exists():
             raise ValueError(f"Review {review_id} not found")
@@ -404,31 +514,28 @@ class WagsWorkspace:
         with open(target_file, "r", encoding="utf-8") as f:
             target_data = json.load(f)
 
-        # Collect latest verdict and all findings per reviewer
         reviewer_latest_verdicts: Dict[str, str] = {}
         all_findings: List[Dict[str, Any]] = []
+        open_findings: List[Dict[str, Any]] = []
+        resolved_findings: List[Dict[str, Any]] = []
         severity_counts = {"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
         blocking_findings: List[Dict[str, Any]] = []
 
-        for path in rev_dir.glob("*.jsonl"):
+        for path in sorted(rev_dir.glob("*.jsonl")):
             reviewer = path.stem
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        d = json.loads(line)
-                        if d.get("verdict"):
-                            reviewer_latest_verdicts[reviewer] = d["verdict"]
-                        for finding in d.get("findings", []):
-                            all_findings.append(finding)
-                            sev = finding.get("severity", "N").upper()
-                            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-                            if sev == "P0" or (sev == "P1" and d.get("verdict") == "block"):
-                                blocking_findings.append(finding)
-                    except Exception:
-                        pass
+            entries = self._read_stream_dicts(path)
+            latest, open_f, resolved_f = self._stream_state(entries)
+            if latest:
+                reviewer_latest_verdicts[reviewer] = latest
+            for d in entries:
+                all_findings.extend(d.get("findings", []))
+            resolved_findings.extend(resolved_f)
+            for finding in open_f:
+                open_findings.append(finding)
+                sev = str(finding.get("severity", "N")).upper()
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+                if sev == "P0" or (sev == "P1" and (latest or "").lower() != "approve"):
+                    blocking_findings.append(finding)
 
         total_reviewers = len(reviewer_latest_verdicts)
         verdict_counts = {"approve": 0, "request_changes": 0, "block": 0, "defer": 0}
@@ -436,13 +543,15 @@ class WagsWorkspace:
             normalized_v = v.lower()
             verdict_counts[normalized_v] = verdict_counts.get(normalized_v, 0) + 1
 
-        # Consensus Evaluation
-        if severity_counts.get("P0", 0) > 0 or verdict_counts.get("block", 0) > 0:
+        open_p0 = sum(1 for x in blocking_findings if str(x.get("severity", "")).upper() == "P0")
+        blocking_p1 = sum(1 for x in blocking_findings if str(x.get("severity", "")).upper() == "P1")
+
+        if open_p0 > 0 or verdict_counts.get("block", 0) > 0:
             overall_verdict = "BLOCK"
-            rationale = f"Blocked by {severity_counts.get('P0', 0)} P0 critical finding(s) or explicit block vote."
-        elif severity_counts.get("P1", 0) > 0 or verdict_counts.get("request_changes", 0) > 0:
+            rationale = f"Blocked by {open_p0} open P0 finding(s) or explicit block vote."
+        elif blocking_p1 > 0 or verdict_counts.get("request_changes", 0) > 0:
             overall_verdict = "REQUEST_CHANGES"
-            rationale = f"Changes required: {severity_counts.get('P1', 0)} P1 finding(s) or request_changes vote(s)."
+            rationale = f"Changes required: {blocking_p1} blocking open P1 finding(s) or request_changes vote(s)."
         elif total_reviewers > 0 and (verdict_counts.get("approve", 0) >= (total_reviewers / 2.0)):
             overall_verdict = "APPROVE"
             rationale = f"Approved by majority ({verdict_counts.get('approve', 0)}/{total_reviewers}) with 0 blockers."
@@ -464,6 +573,8 @@ class WagsWorkspace:
                 "findings_by_severity": severity_counts,
             },
             "blocking_findings": blocking_findings,
+            "open_findings": open_findings,
+            "resolved_findings": resolved_findings,
             "all_findings": all_findings,
         }
 
@@ -511,6 +622,8 @@ def main() -> int:
     p_sub.add_argument("--evidence", default="", help="Evidence citation (e.g. file:line)")
     p_sub.add_argument("--recommendation", default="", help="Recommended remediation")
     p_sub.add_argument("--secret", default=None, help="HMAC secret key")
+    p_sub.add_argument("--resolves", action="append", default=None, help="Finding id from your own earlier entry that this entry resolves (repeatable)")
+    p_sub.add_argument("--supersedes", action="append", default=None, help="entry_hash of your own earlier entry whose findings this entry supersedes (repeatable)")
 
     # tail
     p_tail = subparsers.add_parser("tail", help="Tail and view all entries in a review chronologically")
@@ -573,6 +686,8 @@ def main() -> int:
             findings=findings_list,
             verdict=args.verdict,
             secret_key=args.secret,
+            resolves=args.resolves,
+            supersedes=args.supersedes,
         )
         print(f"[wags] Appended entry seq={entry.sequence} for reviewer '{args.reviewer}' (hash: {entry.entry_hash[:12]}...)")
         return 0
