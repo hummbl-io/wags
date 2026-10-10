@@ -214,6 +214,7 @@ class WagsWorkspace:
             "target_sha256": target_sha256,
             "created_at": target_manifest["created_at"],
             "status": "OPEN",
+            "protocol_version": PROTOCOL_VERSION,
         }
         self._write_index(idx)
 
@@ -389,9 +390,10 @@ class WagsWorkspace:
         keys = keys or {}
         results: Dict[str, Any] = {"review_id": review_id, "streams": {}, "valid": True}
         target_proto = self._target_protocol(rev_dir)
-        legacy_target = target_proto == "0.1.0"
+        # Legacy Go hash form only for genuine 0.1.0 reviews (no 0.2.0 markers).
+        legacy_target = target_proto == "0.1.0" and not self._uses_020_features(rev_dir)
         registered = self._registered(rev_dir)
-        legacy_all = legacy_target and not registered
+        legacy_all = self._registry_mode(rev_dir) == "legacy_all_streams"
         results["registry_mode"] = "legacy_all_streams" if legacy_all else "registered"
 
         for path in rev_dir.glob("*.jsonl"):
@@ -463,7 +465,7 @@ class WagsWorkspace:
 
             if prior_dicts and not legacy_all and reviewer not in registered:
                 stream_valid = False
-                errors.append("stream has entries but reviewer is not registered in reviewers.json")
+                errors.append(f"stream '{reviewer}' has {len(prior_dicts)} entr{'y' if len(prior_dicts) == 1 else 'ies'} but reviewer is not registered in reviewers.json")
             results["streams"][reviewer] = {
                 "valid": stream_valid,
                 "errors": errors,
@@ -476,6 +478,60 @@ class WagsWorkspace:
     # ------------------------------------------------------------------
     # Finding resolution (protocol 0.2.0)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _load_prev_convergence(rev_dir: Path) -> Tuple[str, Dict[str, Any]]:
+        """Return (anchor_status, data): 'absent' | 'unparseable' | 'present'."""
+        conv_file = rev_dir / "converged.json"
+        if not conv_file.exists():
+            return "absent", {}
+        try:
+            with open(conv_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not isinstance(data.get("anchors", {}), dict):
+                return "unparseable", {}
+            return "present", data
+        except Exception:
+            return "unparseable", {}
+
+    @classmethod
+    def _uses_020_features(cls, rev_dir: Path) -> List[str]:
+        """0.2.0-only features found in a review (entries or converged.json)."""
+        found: List[str] = []
+        for path in sorted(rev_dir.glob("*.jsonl")):
+            for d in cls._read_stream_dicts(path):
+                md = d.get("metadata")
+                if isinstance(md, dict) and ("resolves" in md or "supersedes" in md):
+                    found.append(f"{path.stem} seq {d.get('sequence')}: resolves/supersedes")
+        try:
+            with open(rev_dir.parent.parent / "index.json", "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            wpv = str(idx.get("protocol_version", ""))
+            rpv = str(((idx.get("reviews") or {}).get(rev_dir.name) or {}).get("protocol_version", ""))
+            if wpv not in ("", "0.1.0"):
+                found.append(f"index.json workspace protocol_version {wpv}")
+            if rpv not in ("", "0.1.0"):
+                found.append(f"index.json review protocol_version {rpv}")
+        except Exception:
+            pass
+        status, prev = cls._load_prev_convergence(rev_dir)
+        ctx = prev.get("anchor_context") if status == "present" else None
+        if isinstance(ctx, dict) and str(ctx.get("protocol_version", "")) not in ("", "0.1.0"):
+            found.append(f"converged.json anchor_context protocol_version {ctx.get('protocol_version')}")
+        if isinstance(ctx, dict) and ctx.get("registry_mode") == "registered":
+            found.append("converged.json recorded registry_mode=registered")
+        return found
+
+    @classmethod
+    def _registry_mode(cls, rev_dir: Path) -> str:
+        """Legacy count-all mode only for a 0.1.0 target with an empty/missing
+        registry that shows NO 0.2.0 features and never recorded registered mode."""
+        if cls._target_protocol(rev_dir) != "0.1.0" or cls._registered(rev_dir):
+            return "registered"
+        status, _ = cls._load_prev_convergence(rev_dir)
+        if status == "unparseable" or cls._uses_020_features(rev_dir):
+            return "registered"
+        return "legacy_all_streams"
+
     @staticmethod
     def _target_protocol(rev_dir: Path) -> str:
         try:
@@ -571,7 +627,8 @@ class WagsWorkspace:
         resolved_f = [i["finding"] for i in instances if i["resolved"]]
         return latest_verdict, open_f, resolved_f
 
-    def converge_review(self, review_id: str, keys: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def converge_review(self, review_id: str, keys: Optional[Dict[str, str]] = None,
+                        min_quorum: Optional[int] = None) -> Dict[str, Any]:
         """Compute consensus using each reviewer's latest verdict and open findings.
 
         - Verdict per reviewer = verdict of their latest entry that has one.
@@ -599,15 +656,32 @@ class WagsWorkspace:
         invalid_streams: List[Dict[str, Any]] = []
         unregistered_streams: List[str] = []
 
-        # Anchors from the previous convergence (truncation / deletion detection).
-        prev_anchors: Dict[str, Any] = {}
-        conv_file = rev_dir / "converged.json"
-        if conv_file.exists():
-            try:
-                with open(conv_file, "r", encoding="utf-8") as f:
-                    prev_anchors = json.load(f).get("anchors", {}) or {}
-            except Exception:
-                prev_anchors = {}
+        # Anchors from the previous convergence (truncation / deletion / downgrade detection).
+        anchor_status, prev = self._load_prev_convergence(rev_dir)
+        prev_anchors: Dict[str, Any] = prev.get("anchors", {}) or {}
+        prev_ctx: Dict[str, Any] = prev.get("anchor_context") or {} if isinstance(prev.get("anchor_context"), dict) else {}
+        target_proto = self._target_protocol(rev_dir)
+        anchor_problems: List[str] = []
+        if anchor_status == "unparseable":
+            anchor_problems.append("converged.json is unparseable; previous anchors lost")
+        if prev.get("anchor_lost"):
+            anchor_problems.append("an earlier convergence found converged.json unparseable; operator must review")
+        if prev_ctx:
+            pv = str(prev_ctx.get("protocol_version", ""))
+            if pv and pv != "0.1.0" and target_proto == "0.1.0":
+                anchor_problems.append(f"protocol downgrade: anchored {pv}, target.json now {target_proto}")
+            if prev_ctx.get("registry_mode") == "registered" and registry_mode == "legacy_all_streams":
+                anchor_problems.append("registry mode changed from registered to legacy_all_streams")
+            gone = sorted(set(prev_ctx.get("registered_reviewers") or []) - registered)
+            if gone and prev_ctx.get("registry_mode") == "registered":
+                anchor_problems.append(f"registered reviewer(s) disappeared from reviewers.json: {', '.join(gone)}")
+        if target_proto == "0.1.0":
+            feats = self._uses_020_features(rev_dir)
+            if feats and not self._registered(rev_dir):
+                anchor_problems.append("target.json says 0.1.0 but review uses 0.2.0 features: " + "; ".join(feats))
+            elif any("resolves/supersedes" in x for x in feats):
+                anchor_problems.append("target.json says 0.1.0 but entries use resolves/supersedes (0.2.0): "
+                                       + "; ".join(x for x in feats if "resolves/supersedes" in x))
         regressed_streams: List[Dict[str, Any]] = []
         for anchored, a in sorted(prev_anchors.items()):
             ap = rev_dir / f"{anchored}.jsonl"
@@ -676,7 +750,16 @@ class WagsWorkspace:
         open_p0 = severity_counts.get("P0", 0)  # includes unknown severities (treated as P0)
         blocking_p1 = len(blocking_findings) - open_p0
 
-        if regressed_streams:
+        # Quorum: by default every registered reviewer must have a latest verdict
+        # before the review can APPROVE (min_quorum overrides; legacy mode = voters).
+        quorum_required = (len(registered) if registry_mode == "registered" else total_reviewers) \
+            if min_quorum is None else int(min_quorum)
+        quorum_met = total_reviewers > 0 and total_reviewers >= quorum_required
+
+        if anchor_problems:
+            overall_verdict = "BLOCK"
+            rationale = "Anchor/protocol problem: " + "; ".join(anchor_problems)
+        elif regressed_streams:
             overall_verdict = "BLOCK"
             rationale = (f"Regression: {len(regressed_streams)} stream(s) lost entries or registration since the last "
                          f"convergence anchor ({', '.join(x['reviewer'] for x in regressed_streams)}).")
@@ -690,6 +773,10 @@ class WagsWorkspace:
         elif blocking_p1 > 0 or verdict_counts.get("request_changes", 0) > 0:
             overall_verdict = "REQUEST_CHANGES"
             rationale = f"Changes required: {blocking_p1} blocking open P1 finding(s) or request_changes vote(s)."
+        elif not quorum_met:
+            overall_verdict = "DEFER"
+            rationale = (f"Pending quorum: {total_reviewers}/{quorum_required} required reviewers have voted "
+                         f"({len(registered)} registered).")
         elif total_reviewers > 0 and (verdict_counts.get("approve", 0) >= (total_reviewers / 2.0)):
             overall_verdict = "APPROVE"
             rationale = f"Approved by majority ({verdict_counts.get('approve', 0)}/{total_reviewers}) with 0 blockers."
@@ -711,6 +798,20 @@ class WagsWorkspace:
             if ents:
                 anchors[name] = {"sequence": ents[-1].get("sequence"), "entry_hash": ents[-1].get("entry_hash")}
 
+        # Anchor context: a problem keeps the OLD context so the BLOCK persists.
+        if prev_ctx and anchor_problems:
+            anchor_context = prev_ctx
+        else:
+            anchor_context = {
+                "protocol_version": target_proto,
+                "registry_mode": registry_mode,
+                "registered_reviewers": sorted(set(registered) | set(prev_ctx.get("registered_reviewers") or []))
+                if anchor_problems else sorted(registered),
+            }
+        anchor_lost = bool(prev.get("anchor_lost")) or anchor_status == "unparseable"
+        if anchor_status == "unparseable":
+            anchors = {}
+
         converged_manifest = {
             "protocol_version": PROTOCOL_VERSION,
             "review_id": review_id,
@@ -718,7 +819,13 @@ class WagsWorkspace:
             "target": target_data.get("target", {}),
             "overall_verdict": overall_verdict,
             "rationale": rationale,
-            "quorum_met": total_reviewers > 0,
+            "quorum_met": quorum_met,
+            "quorum": {"required": quorum_required, "voted": total_reviewers, "registered": len(registered),
+                       "min_quorum": min_quorum},
+            "anchor_status": anchor_status,
+            "anchor_problems": anchor_problems,
+            "anchor_context": anchor_context,
+            "anchor_lost": anchor_lost,
             "summary": {
                 "total_reviewers": total_reviewers,
                 "verdicts": verdict_counts,
@@ -798,6 +905,8 @@ def main() -> int:
     # converge
     p_conv = subparsers.add_parser("converge", help="Calculate consensus and converge review")
     p_conv.add_argument("review_id", help="Review ID")
+    p_conv.add_argument("--min-quorum", type=int, default=None,
+                        help="Minimum reviewers with a verdict before APPROVE (default: all registered)")
 
     # list
     subparsers.add_parser("list", help="List all reviews in the workspace")
@@ -877,7 +986,7 @@ def main() -> int:
             return 1
 
     elif args.command == "converge":
-        res = ws.converge_review(args.review_id)
+        res = ws.converge_review(args.review_id, min_quorum=args.min_quorum)
         print(f"=== wags Convergence Report: {args.review_id} ===")
         print(f"Overall Verdict: {res['overall_verdict']}")
         print(f"Rationale:       {res['rationale']}")

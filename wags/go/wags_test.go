@@ -140,6 +140,11 @@ func TestGoCannotResolveOthersAndP0Veto(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, _ = ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "DEFER" {
+		t.Fatalf("rev-b has not voted: quorum pending, got %v", c["overall_verdict"])
+	}
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	c, _ = ws.ConvergeReview(rid)
 	if c["overall_verdict"] != "APPROVE" {
 		t.Fatalf("resolved P0 should clear, got %v", c["overall_verdict"])
 	}
@@ -318,6 +323,11 @@ func TestGoLegacyHashOnlyFor010AndNotAfterCanonical(t *testing.T) {
 	_ = json.Unmarshal(tb, &tg)
 	tg["protocol_version"] = "0.1.0"
 	writeJSON(t, filepath.Join(revDir, "target.json"), tg)
+	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
+		t.Fatal("0.1.0 target edited into a 0.2.0 workspace (index marker) must still reject legacy")
+	}
+	// simulate a genuine 0.1.0 workspace
+	writeJSON(t, ws.IndexFile, map[string]interface{}{"protocol_version": "0.1.0", "reviews": map[string]interface{}{}})
 	if ok, errs, _ := ws.VerifyReview(rid, nil); !ok {
 		t.Fatalf("legacy hash should verify on 0.1.0 target: %v", errs)
 	}
@@ -349,5 +359,102 @@ func TestGoFloat32AndEmptyRefs(t *testing.T) {
 		if _, err := ws.SubmitEntryWithMetadata(rid, "rev-a", "review", nil, "approve", "", md); err == nil {
 			t.Fatalf("empty refs should be rejected: %v", md)
 		}
+	}
+}
+
+func downgrade(t *testing.T, revDir string) {
+	var tg map[string]interface{}
+	b, _ := os.ReadFile(filepath.Join(revDir, "target.json"))
+	_ = json.Unmarshal(b, &tg)
+	tg["protocol_version"] = "0.1.0"
+	writeJSON(t, filepath.Join(revDir, "target.json"), tg)
+	writeJSON(t, filepath.Join(revDir, "reviewers.json"), map[string]interface{}{})
+}
+
+func TestGoDowngradeBlocks(t *testing.T) {
+	for _, anchored := range []bool{false, true} {
+		ws, rid, done := newResWS(t)
+		revDir := filepath.Join(ws.ReviewsDir, rid)
+		_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "defer", "")
+		_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "defer", "")
+		if anchored {
+			_, _ = ws.ConvergeReview(rid)
+		}
+		_, _ = ws.SubmitEntry(rid, "evil", "review", nil, "approve", "")
+		_, _ = ws.SubmitEntry(rid, "evil2", "review", nil, "approve", "")
+		downgrade(t, revDir)
+		c, _ := ws.ConvergeReview(rid)
+		if c["overall_verdict"] != "BLOCK" || c["registry_mode"] != "registered" {
+			t.Fatalf("anchored=%v: got %v / %v", anchored, c["overall_verdict"], c["registry_mode"])
+		}
+		if anchored {
+			if len(c["anchor_problems"].([]string)) == 0 {
+				t.Fatal("expected anchor_problems")
+			}
+			if c2, _ := ws.ConvergeReview(rid); c2["overall_verdict"] != "BLOCK" {
+				t.Fatal("downgrade BLOCK must persist")
+			}
+		}
+		done()
+	}
+}
+
+func TestGoUnparseableConvergedAndAnchorStatus(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	c, _ := ws.ConvergeReview(rid)
+	if c["anchor_status"] != "absent" || c["overall_verdict"] != "APPROVE" {
+		t.Fatalf("first: %v %v", c["anchor_status"], c["overall_verdict"])
+	}
+	c, _ = ws.ConvergeReview(rid)
+	if c["anchor_status"] != "present" || c["overall_verdict"] != "APPROVE" {
+		t.Fatalf("second: %v %v (%v)", c["anchor_status"], c["overall_verdict"], c["rationale"])
+	}
+	_ = os.WriteFile(filepath.Join(ws.ReviewsDir, rid, "converged.json"), []byte("garbage"), 0644)
+	c, _ = ws.ConvergeReview(rid)
+	if c["anchor_status"] != "unparseable" || c["overall_verdict"] != "BLOCK" {
+		t.Fatalf("garbage: %v %v", c["anchor_status"], c["overall_verdict"])
+	}
+	if c, _ = ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatal("anchor_lost BLOCK must persist")
+	}
+}
+
+func TestGo010TargetWithResolvesBlocks(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	revDir := filepath.Join(ws.ReviewsDir, rid)
+	var tg map[string]interface{}
+	b, _ := os.ReadFile(filepath.Join(revDir, "target.json"))
+	_ = json.Unmarshal(b, &tg)
+	tg["protocol_version"] = "0.1.0"
+	writeJSON(t, filepath.Join(revDir, "target.json"), tg)
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P1")}, "request_changes", "")
+	_, _ = ws.SubmitEntryWithMetadata(rid, "rev-a", "review", nil, "approve", "", map[string]interface{}{"resolves": []interface{}{"X"}})
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatalf("got %v", c["overall_verdict"])
+	}
+}
+
+func TestGoQuorumAndUnregisteredMessage(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_ = ws.RegisterReviewer(rid, "silent", "", "reviewer")
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "DEFER" || c["quorum_met"] != false {
+		t.Fatalf("quorum: %v", c["overall_verdict"])
+	}
+	if c, _ := ws.ConvergeReviewOpts(rid, 2); c["overall_verdict"] != "APPROVE" {
+		t.Fatalf("min_quorum=2: %v", c["overall_verdict"])
+	}
+	_, _ = ws.SubmitEntry(rid, "zz", "review", nil, "approve", "")
+	_, errs, _ := ws.VerifyReview(rid, nil)
+	joined := strings.Join(errs, "|")
+	if strings.Contains(joined, "line 0") || !strings.Contains(joined, "has 1 entry but reviewer is not registered") {
+		t.Fatalf("message: %v", errs)
 	}
 }

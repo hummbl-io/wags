@@ -404,6 +404,27 @@ func (ws *WagsWorkspace) InitReview(targetPath, targetType, desc, initiator, cus
 	}
 	_ = os.WriteFile(filepath.Join(revDir, "reviewers.json"), []byte("{}"), 0644)
 
+	// Record the review in index.json (parity with Python), including protocol_version.
+	idx := map[string]interface{}{"protocol_version": ProtocolVersion, "reviews": map[string]interface{}{}}
+	if b, err := os.ReadFile(ws.IndexFile); err == nil {
+		_ = json.Unmarshal(b, &idx)
+	}
+	rv, ok := idx["reviews"].(map[string]interface{})
+	if !ok {
+		rv = map[string]interface{}{}
+	}
+	rv[reviewID] = map[string]interface{}{
+		"target":           absTarget,
+		"target_sha256":    sha,
+		"created_at":       manifest["created_at"],
+		"status":           "OPEN",
+		"protocol_version": ProtocolVersion,
+	}
+	idx["reviews"] = rv
+	if b, err := json.MarshalIndent(idx, "", "  "); err == nil {
+		_ = os.WriteFile(ws.IndexFile, b, 0644)
+	}
+
 	return manifest, nil
 }
 
@@ -592,7 +613,87 @@ func registeredReviewers(revDir string) map[string]interface{} {
 // legacyAllStreams: count every stream only for protocol 0.1.0 targets with an
 // empty/missing registry (wags-go 0.1.0 never populated reviewers.json).
 func legacyAllStreams(revDir string) bool {
-	return targetProtocol(revDir) == "0.1.0" && len(registeredReviewers(revDir)) == 0
+	return registryModeFor(revDir) == "legacy_all_streams"
+}
+
+// loadPrevConvergence returns ("absent"|"unparseable"|"present", data).
+func loadPrevConvergence(revDir string) (string, map[string]interface{}) {
+	b, err := os.ReadFile(filepath.Join(revDir, "converged.json"))
+	if err != nil {
+		return "absent", map[string]interface{}{}
+	}
+	var data map[string]interface{}
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil || data == nil {
+		return "unparseable", map[string]interface{}{}
+	}
+	if a, ok := data["anchors"]; ok && a != nil {
+		if _, isMap := a.(map[string]interface{}); !isMap {
+			return "unparseable", map[string]interface{}{}
+		}
+	}
+	return "present", data
+}
+
+// uses020Features lists 0.2.0-only features found in a review. Mirrors Python.
+func uses020Features(revDir string) []string {
+	found := []string{}
+	matches, _ := filepath.Glob(filepath.Join(revDir, "*.jsonl"))
+	sort.Strings(matches)
+	for _, m := range matches {
+		name := strings.TrimSuffix(filepath.Base(m), ".jsonl")
+		ents, _ := readStream(m)
+		for _, e := range ents {
+			if e.Metadata == nil {
+				continue
+			}
+			_, r := e.Metadata["resolves"]
+			_, sp := e.Metadata["supersedes"]
+			if r || sp {
+				found = append(found, fmt.Sprintf("%s seq %d: resolves/supersedes", name, e.Sequence))
+			}
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(filepath.Dir(filepath.Dir(revDir)), "index.json")); err == nil {
+		var idx map[string]interface{}
+		if json.Unmarshal(b, &idx) == nil {
+			if wpv, _ := idx["protocol_version"].(string); wpv != "" && wpv != "0.1.0" {
+				found = append(found, "index.json workspace protocol_version "+wpv)
+			}
+			if rv, ok := idx["reviews"].(map[string]interface{}); ok {
+				if r, ok := rv[filepath.Base(revDir)].(map[string]interface{}); ok {
+					if rpv, _ := r["protocol_version"].(string); rpv != "" && rpv != "0.1.0" {
+						found = append(found, "index.json review protocol_version "+rpv)
+					}
+				}
+			}
+		}
+	}
+	status, prev := loadPrevConvergence(revDir)
+	if status == "present" {
+		if ctx, ok := prev["anchor_context"].(map[string]interface{}); ok {
+			if pv, _ := ctx["protocol_version"].(string); pv != "" && pv != "0.1.0" {
+				found = append(found, "converged.json anchor_context protocol_version "+pv)
+			}
+			if rm, _ := ctx["registry_mode"].(string); rm == "registered" {
+				found = append(found, "converged.json recorded registry_mode=registered")
+			}
+		}
+	}
+	return found
+}
+
+// registryModeFor: legacy count-all only for a 0.1.0 target with an empty registry,
+// no 0.2.0 features and no previously recorded registered mode.
+func registryModeFor(revDir string) string {
+	if targetProtocol(revDir) != "0.1.0" || len(registeredReviewers(revDir)) > 0 {
+		return "registered"
+	}
+	if st, _ := loadPrevConvergence(revDir); st == "unparseable" || len(uses020Features(revDir)) > 0 {
+		return "registered"
+	}
+	return "legacy_all_streams"
 }
 
 func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (bool, []string, error) {
@@ -610,9 +711,9 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 
 	valid := true
 	var errorsList []string
-	legacyTarget := targetProtocol(revDir) == "0.1.0"
+	legacyTarget := targetProtocol(revDir) == "0.1.0" && len(uses020Features(revDir)) == 0
 	registered := registeredReviewers(revDir)
-	legacyAll := legacyTarget && len(registered) == 0
+	legacyAll := registryModeFor(revDir) == "legacy_all_streams"
 
 	for _, match := range matches {
 		reviewer := strings.TrimSuffix(filepath.Base(match), ".jsonl")
@@ -670,7 +771,11 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 		}
 		if _, ok := registered[reviewer]; len(prior) > 0 && !legacyAll && !ok {
 			valid = false
-			errorsList = append(errorsList, fmt.Sprintf("%s line 0: stream has entries but reviewer is not registered in reviewers.json", reviewer))
+			noun := "entries"
+			if len(prior) == 1 {
+				noun = "entry"
+			}
+			errorsList = append(errorsList, fmt.Sprintf("%s: stream '%s' has %d %s but reviewer is not registered in reviewers.json", reviewer, reviewer, len(prior), noun))
 		}
 	}
 	return valid, errorsList, nil
@@ -825,6 +930,11 @@ func streamState(entries []StreamEntry) (string, []map[string]interface{}, []map
 
 // ConvergeReview: latest verdict per reviewer + open findings only (protocol 0.2.0).
 func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}, error) {
+	return ws.ConvergeReviewOpts(reviewID, -1)
+}
+
+// ConvergeReviewOpts: minQuorum < 0 means "every registered reviewer must vote".
+func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map[string]interface{}, error) {
 	revDir := filepath.Join(ws.ReviewsDir, reviewID)
 	targetBytes, err := os.ReadFile(filepath.Join(revDir, "target.json"))
 	if err != nil {
@@ -847,16 +957,66 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		registryMode = "legacy_all_streams"
 	}
 
-	// Anchors from the previous convergence (truncation / deletion detection).
+	// Anchors from the previous convergence (truncation / deletion / downgrade detection).
+	anchorStatus, prev := loadPrevConvergence(revDir)
 	prevAnchors := map[string]map[string]interface{}{}
-	if b, err := os.ReadFile(filepath.Join(revDir, "converged.json")); err == nil {
-		var prev struct {
-			Anchors map[string]map[string]interface{} `json:"anchors"`
+	if am, ok := prev["anchors"].(map[string]interface{}); ok {
+		for k, v := range am {
+			if vm, ok := v.(map[string]interface{}); ok {
+				prevAnchors[k] = vm
+			}
 		}
-		dec := json.NewDecoder(strings.NewReader(string(b)))
-		dec.UseNumber()
-		if dec.Decode(&prev) == nil && prev.Anchors != nil {
-			prevAnchors = prev.Anchors
+	}
+	prevCtx, _ := prev["anchor_context"].(map[string]interface{})
+	prevLost, _ := prev["anchor_lost"].(bool)
+	targetProto := targetProtocol(revDir)
+	anchorProblems := []string{}
+	if anchorStatus == "unparseable" {
+		anchorProblems = append(anchorProblems, "converged.json is unparseable; previous anchors lost")
+	}
+	if prevLost {
+		anchorProblems = append(anchorProblems, "an earlier convergence found converged.json unparseable; operator must review")
+	}
+	prevRegistered := []string{}
+	if prevCtx != nil {
+		pv, _ := prevCtx["protocol_version"].(string)
+		if pv != "" && pv != "0.1.0" && targetProto == "0.1.0" {
+			anchorProblems = append(anchorProblems, fmt.Sprintf("protocol downgrade: anchored %s, target.json now %s", pv, targetProto))
+		}
+		prm, _ := prevCtx["registry_mode"].(string)
+		if prm == "registered" && registryMode == "legacy_all_streams" {
+			anchorProblems = append(anchorProblems, "registry mode changed from registered to legacy_all_streams")
+		}
+		if rl, ok := prevCtx["registered_reviewers"].([]interface{}); ok {
+			gone := []string{}
+			for _, x := range rl {
+				if n, ok := x.(string); ok {
+					prevRegistered = append(prevRegistered, n)
+					if _, still := registered[n]; !still {
+						gone = append(gone, n)
+					}
+				}
+			}
+			sort.Strings(gone)
+			if len(gone) > 0 && prm == "registered" {
+				anchorProblems = append(anchorProblems, "registered reviewer(s) disappeared from reviewers.json: "+strings.Join(gone, ", "))
+			}
+		}
+	}
+	if targetProto == "0.1.0" {
+		feats := uses020Features(revDir)
+		if len(feats) > 0 && len(registered) == 0 {
+			anchorProblems = append(anchorProblems, "target.json says 0.1.0 but review uses 0.2.0 features: "+strings.Join(feats, "; "))
+		} else {
+			rs := []string{}
+			for _, x := range feats {
+				if strings.Contains(x, "resolves/supersedes") {
+					rs = append(rs, x)
+				}
+			}
+			if len(rs) > 0 {
+				anchorProblems = append(anchorProblems, "target.json says 0.1.0 but entries use resolves/supersedes (0.2.0): "+strings.Join(rs, "; "))
+			}
 		}
 	}
 	regressedStreams := []map[string]interface{}{}
@@ -916,7 +1076,7 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		reviewer := strings.TrimSuffix(filepath.Base(m), ".jsonl")
 		var serrs []string
 		for _, e := range verrs {
-			if strings.HasPrefix(e, reviewer+" line ") {
+			if strings.HasPrefix(e, reviewer+" line ") || strings.HasPrefix(e, reviewer+": ") {
 				serrs = append(serrs, e)
 			}
 		}
@@ -972,7 +1132,20 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	overallVerdict := "DEFER"
 	rationale := "Insufficient quorum or inconclusive vote."
 
-	if len(regressedStreams) > 0 {
+	quorumRequired := minQuorum
+	if minQuorum < 0 {
+		if registryMode == "registered" {
+			quorumRequired = len(registered)
+		} else {
+			quorumRequired = totalReviewers
+		}
+	}
+	quorumMet := totalReviewers > 0 && totalReviewers >= quorumRequired
+
+	if len(anchorProblems) > 0 {
+		overallVerdict = "BLOCK"
+		rationale = "Anchor/protocol problem: " + strings.Join(anchorProblems, "; ")
+	} else if len(regressedStreams) > 0 {
 		names := []string{}
 		for _, x := range regressedStreams {
 			names = append(names, x["reviewer"].(string))
@@ -992,6 +1165,9 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	} else if blockingP1 > 0 || verdictCounts["request_changes"] > 0 {
 		overallVerdict = "REQUEST_CHANGES"
 		rationale = fmt.Sprintf("Changes required: %d blocking open P1 finding(s) or request_changes vote(s).", blockingP1)
+	} else if !quorumMet {
+		overallVerdict = "DEFER"
+		rationale = fmt.Sprintf("Pending quorum: %d/%d required reviewers have voted (%d registered).", totalReviewers, quorumRequired, len(registered))
 	} else if totalReviewers > 0 && float64(verdictCounts["approve"]) >= (float64(totalReviewers)/2.0) {
 		overallVerdict = "APPROVE"
 		rationale = fmt.Sprintf("Approved by majority (%d/%d) with 0 blockers.", verdictCounts["approve"], totalReviewers)
@@ -1015,6 +1191,37 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		}
 	}
 
+	var anchorContext map[string]interface{}
+	if prevCtx != nil && len(anchorProblems) > 0 {
+		anchorContext = prevCtx
+	} else {
+		regs := []string{}
+		for n := range registered {
+			regs = append(regs, n)
+		}
+		if len(anchorProblems) > 0 {
+			seen := map[string]bool{}
+			for _, n := range regs {
+				seen[n] = true
+			}
+			for _, n := range prevRegistered {
+				if !seen[n] {
+					regs = append(regs, n)
+				}
+			}
+		}
+		sort.Strings(regs)
+		anchorContext = map[string]interface{}{"protocol_version": targetProto, "registry_mode": registryMode, "registered_reviewers": regs}
+	}
+	anchorLost := prevLost || anchorStatus == "unparseable"
+	if anchorStatus == "unparseable" {
+		anchors = map[string]interface{}{}
+	}
+	var mq interface{}
+	if minQuorum >= 0 {
+		mq = minQuorum
+	}
+
 	converged := map[string]interface{}{
 		"protocol_version": ProtocolVersion,
 		"review_id":        reviewID,
@@ -1022,7 +1229,12 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		"target":           targetManifest["target"],
 		"overall_verdict":  overallVerdict,
 		"rationale":        rationale,
-		"quorum_met":       totalReviewers > 0,
+		"quorum_met":       quorumMet,
+		"quorum":           map[string]interface{}{"required": quorumRequired, "voted": totalReviewers, "registered": len(registered), "min_quorum": mq},
+		"anchor_status":    anchorStatus,
+		"anchor_problems":  anchorProblems,
+		"anchor_context":   anchorContext,
+		"anchor_lost":      anchorLost,
 		"summary": map[string]interface{}{
 			"total_reviewers":           totalReviewers,
 			"verdicts":                  verdictCounts,
@@ -1097,7 +1309,10 @@ func main() {
 			fmt.Println("Usage: wags converge <review_id>")
 			os.Exit(1)
 		}
-		conv, err := ws.ConvergeReview(os.Args[2])
+		convCmd := flag.NewFlagSet("converge", flag.ExitOnError)
+		minQ := convCmd.Int("min-quorum", -1, "Minimum reviewers with a verdict before APPROVE (default: all registered)")
+		_ = convCmd.Parse(os.Args[3:])
+		conv, err := ws.ConvergeReviewOpts(os.Args[2], *minQ)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

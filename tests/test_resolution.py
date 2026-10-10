@@ -84,6 +84,7 @@ class TestResolution(unittest.TestCase):
         self.ws.submit_entry(self.rid, "rev-a", findings=[_f("a-P0-01", "P0")], verdict="block")
         self.ws.submit_entry(self.rid, "rev-a", verdict="approve", resolves=["a-P0-01"])
         self.ws.submit_entry(self.rid, "rev-b", verdict="approve")
+        self.ws.submit_entry(self.rid, "author", verdict="approve")
         self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "APPROVE")
 
     def test_cannot_resolve_other_reviewers_findings(self):
@@ -223,6 +224,7 @@ class TestReviewRound2(unittest.TestCase):
         self.assertEqual(c["overall_verdict"], "BLOCK")
 
     def test_empty_unregistered_stream_ignored(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
         self.ws.submit_entry(self.rid, "b", verdict="approve")
         (self.stream / "zz.jsonl").write_text("")
         self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "APPROVE")
@@ -433,6 +435,12 @@ class TestReviewRound3(unittest.TestCase):
         t = json.loads((self.dir / "target.json").read_text())
         t["protocol_version"] = "0.1.0"
         (self.dir / "target.json").write_text(json.dumps(t))
+        # simulate a genuine 0.1.0 workspace (no 0.2.0 markers in index.json)
+        ip = Path(self.tmp) / "index.json"
+        idx = json.loads(ip.read_text())
+        idx["protocol_version"] = "0.1.0"
+        idx["reviews"][self.rid].pop("protocol_version", None)
+        ip.write_text(json.dumps(idx))
 
     # MTSMU P2: empty refs
     def test_empty_resolves_supersedes_rejected(self):
@@ -440,3 +448,131 @@ class TestReviewRound3(unittest.TestCase):
         for kw in (dict(resolves=[]), dict(supersedes=[])):
             with self.assertRaises(ValueError):
                 self.ws.submit_entry(self.rid, "a", verdict="approve", **kw)
+
+
+class TestReviewRound4(unittest.TestCase):
+    """Fixes from round-3 reviews at 05e2974 (Quilter P1-01 / MTSMU P2-a,b,c, Quilter P3s)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wags_r4_")
+        self.ws = WagsWorkspace(self.tmp)
+        tgt = Path(self.tmp) / "t.md"
+        tgt.write_text("# t\n", encoding="utf-8")
+        self.rid = self.ws.init_review(tgt, review_id="rev-r4")["review_id"]
+        for r in ("a", "b"):
+            self.ws.register_reviewer(self.rid, r)
+        self.dir = Path(self.tmp) / "reviews" / self.rid
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _go(self, *args):
+        if shutil.which("go") is None:
+            self.skipTest("go not installed")
+        import os
+        return subprocess.run(["go", "run", "wags.go", "converge", self.rid, *args], cwd=GO_DIR,
+                              env=dict(os.environ, WAGS_WORKSPACE=self.tmp),
+                              capture_output=True, text=True, timeout=120).stdout
+
+    def _downgrade(self):
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+        (self.dir / "reviewers.json").write_text("{}")
+
+    def _evil(self):
+        self.ws.submit_entry(self.rid, "evil", verdict="approve")
+        self.ws.submit_entry(self.rid, "evil2", verdict="approve")
+
+    def test_R6d_downgrade_without_anchor_blocks(self):
+        self.ws.submit_entry(self.rid, "a", verdict="defer")
+        self.ws.submit_entry(self.rid, "b", verdict="defer")
+        self._evil()
+        self._downgrade()
+        self.assertFalse(self.ws.verify_review(self.rid)["valid"])
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["registry_mode"], "registered")
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertIn("BLOCK", self._go())
+
+    def test_R6da_downgrade_after_anchor_blocks_and_persists(self):
+        self.ws.submit_entry(self.rid, "a", verdict="defer")
+        self.ws.submit_entry(self.rid, "b", verdict="defer")
+        self.ws.converge_review(self.rid)
+        self._evil()
+        self._downgrade()
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertTrue(any("disappeared" in p for p in c["anchor_problems"]))
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+        self.assertIn("BLOCK", self._go())
+
+    def test_anchor_records_context(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        c1 = self.ws.converge_review(self.rid)
+        self.assertEqual(c1["anchor_status"], "absent")
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["anchor_status"], "present")
+        self.assertEqual(c["anchor_context"], {"protocol_version": "0.2.0", "registry_mode": "registered",
+                                               "registered_reviewers": ["a", "b"]})
+        self.assertEqual(c["overall_verdict"], "APPROVE")
+
+    def test_010_target_with_resolves_fails_closed(self):
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+        self.ws.submit_entry(self.rid, "a", findings=[_f("X", "P1")], verdict="request_changes")
+        self.ws.submit_entry(self.rid, "a", verdict="approve", resolves=["X"])
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertTrue(any("resolves/supersedes" in p for p in c["anchor_problems"]))
+        self.assertIn("BLOCK", self._go())
+
+    def test_unparseable_converged_blocks_and_persists(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        self.ws.converge_review(self.rid)
+        (self.dir / "converged.json").write_text("garbage")
+        self.assertIn("BLOCK", self._go())  # go first on the garbage file
+        (self.dir / "converged.json").write_text("garbage")
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["anchor_status"], "unparseable")
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertTrue(c["anchor_lost"])
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+
+    def test_unregistered_message_has_no_line_zero(self):
+        self.ws.submit_entry(self.rid, "zz", verdict="approve")
+        errs = self.ws.verify_review(self.rid)["streams"]["zz"]["errors"]
+        self.assertTrue(any("has 1 entry but reviewer is not registered" in e for e in errs))
+        self.assertFalse(any("line 0" in e for e in errs))
+
+    def test_R11_quorum_requires_all_registered(self):
+        self.ws.register_reviewer(self.rid, "silent")
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "DEFER")
+        self.assertEqual(c["quorum"]["required"], 3)
+        self.assertFalse(c["quorum_met"])
+        self.assertIn("DEFER", self._go())
+        self.assertEqual(self.ws.converge_review(self.rid, min_quorum=2)["overall_verdict"], "APPROVE")
+        self.assertIn("APPROVE", self._go("-min-quorum", "2"))
+        self.ws.submit_entry(self.rid, "silent", findings=[_f("S", "P0")], verdict="block")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+
+    def test_R5d_downgraded_target_does_not_reenable_legacy_hash(self):
+        from wags import StreamEntry
+        self.ws.submit_entry(self.rid, "a", findings=[Finding("x", "P2", "s", "<b> & c", "e", "r")], verdict="approve")
+        p = self.dir / "a.jsonl"
+        d = json.loads(p.read_text())
+        e = StreamEntry(**{k: d[k] for k in ["sequence", "timestamp", "review_id", "reviewer", "phase",
+                                             "prev_hash", "findings", "verdict", "rebuttal_to", "metadata"]})
+        d["entry_hash"] = e.compute_legacy_go_hash()
+        p.write_text(json.dumps(d) + "\n")
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+        self.assertFalse(self.ws.verify_review(self.rid)["valid"])
