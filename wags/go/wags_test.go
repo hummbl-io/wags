@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,7 +83,13 @@ func newResWS(t *testing.T) (*WagsWorkspace, string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return ws, m["review_id"].(string), func() { os.RemoveAll(dir) }
+	rid := m["review_id"].(string)
+	for _, r := range []string{"rev-a", "rev-b"} {
+		if err := ws.RegisterReviewer(rid, r, "", "reviewer"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ws, rid, func() { os.RemoveAll(dir) }
 }
 
 func f(id, sev string) Finding {
@@ -108,7 +115,7 @@ func TestGoResolvesAndLatestVerdict(t *testing.T) {
 	if c["overall_verdict"] != "APPROVE" {
 		t.Fatalf("want APPROVE got %v (%v)", c["overall_verdict"], c["rationale"])
 	}
-	if n := c["summary"].(map[string]interface{})["findings_by_severity"].(map[string]int)["P1"]; n != 0 {
+	if n := c["summary"].(map[string]interface{})["open_findings_by_severity"].(map[string]int)["P1"]; n != 0 {
 		t.Fatalf("want 0 open P1, got %d", n)
 	}
 }
@@ -141,5 +148,86 @@ func TestGoCanonicalJSONNoHTMLEscape(t *testing.T) {
 	b, _ := canonicalJSON(map[string]interface{}{"b": ">=1.4 & <2 →", "a": 1})
 	if string(b) != `{"a":1,"b":">=1.4 & <2 →"}` {
 		t.Fatalf("got %s", b)
+	}
+}
+
+func TestGoReraisedP0AfterResolveVetoes(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P0")}, "block", "")
+	if _, err := ws.SubmitEntryWithMetadata(rid, "rev-a", "review", nil, "approve", "", map[string]interface{}{"resolves": []interface{}{"X"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P0")}, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	if ok, errs, _ := ws.VerifyReview(rid, nil); !ok {
+		t.Fatal(errs)
+	}
+	c, _ := ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "BLOCK" {
+		t.Fatalf("re-raised P0 must veto, got %v", c["overall_verdict"])
+	}
+}
+
+func TestGoReorderedStreamBlocksAndUnregisteredExcluded(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "block", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	p := filepath.Join(ws.ReviewsDir, rid, "rev-a.jsonl")
+	b, _ := os.ReadFile(p)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	_ = os.WriteFile(p, []byte(lines[1]+"\n"+lines[0]+"\n"), 0644)
+	_ = os.WriteFile(filepath.Join(ws.ReviewsDir, rid, "zz.jsonl"), []byte(`{"verdict":"approve","findings":[]}`+"\n"), 0644)
+	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
+		t.Fatal("reordered stream should fail verify")
+	}
+	c, _ := ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "BLOCK" {
+		t.Fatalf("invalid registered stream must block, got %v", c["overall_verdict"])
+	}
+	if u := c["unregistered_streams"].([]string); len(u) != 1 || u[0] != "zz" {
+		t.Fatalf("unregistered not reported: %v", u)
+	}
+	if inv := c["invalid_streams"].([]map[string]interface{}); len(inv) != 1 {
+		t.Fatalf("invalid not reported: %v", inv)
+	}
+}
+
+func TestGoSubmitValidation(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	if _, err := ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("x", "critical")}, "approve", ""); err == nil {
+		t.Fatal("unknown severity should be rejected")
+	}
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P1")}, "request_changes", "")
+	for _, md := range []map[string]interface{}{{"resolves": nil}, {"supersedes": nil}, {"supersedes": []interface{}{"nope"}}} {
+		if _, err := ws.SubmitEntryWithMetadata(rid, "rev-a", "review", nil, "approve", "", md); err == nil {
+			t.Fatalf("expected rejection for %v", md)
+		}
+	}
+}
+
+func TestGoCanonicalJSONPythonParity(t *testing.T) {
+	line := `{"metadata":{"one":1.0,"negz":-0.0,"exp":1e-07,"big":100000000000000000000},"findings":[{"finding":"lit \\u2028 real ` + "\u2028" + ` <b>&"}]}`
+	var e StreamEntry
+	if err := decodeEntry(line, &e); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := canonicalJSON(map[string]interface{}{"metadata": e.Metadata, "findings": e.Findings})
+	want := `{"findings":[{"finding":"lit \\u2028 real ` + "\u2028" + ` <b>&"}],"metadata":{"big":100000000000000000000,"exp":1e-07,"negz":-0.0,"one":1.0}}`
+	if string(b) != want {
+		t.Fatalf("got  %s\nwant %s", b, want)
+	}
+}
+
+func TestGoAcceptsLegacyGoHash(t *testing.T) {
+	ws, err := NewWagsWorkspace(filepath.Join("..", "..", "tests", "fixtures", "legacy-go-010"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, errs, _ := ws.VerifyReview("rev-legacy-go-010", nil); !ok {
+		t.Fatalf("legacy entry should verify: %v", errs)
 	}
 }

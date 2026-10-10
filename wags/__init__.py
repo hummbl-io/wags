@@ -18,6 +18,7 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = "0.2.0"
+VALID_SEVERITIES = ("P0", "P1", "P2", "P3", "N")
 GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
 
 
@@ -77,6 +78,21 @@ class StreamEntry:
         }
         return _compute_sha256(_canonical_json(payload).encode("utf-8"))
 
+    def compute_legacy_go_hash(self) -> str:
+        """Hash as written by wags-go 0.1.0 (encoding/json.Marshal escaped <, >, &,
+        U+2028 and U+2029). Accepted on verify only; never produced."""
+        payload = {
+            "sequence": self.sequence, "timestamp": self.timestamp, "review_id": self.review_id,
+            "reviewer": self.reviewer, "phase": self.phase, "prev_hash": self.prev_hash,
+            "findings": self.findings, "verdict": self.verdict, "rebuttal_to": self.rebuttal_to,
+            "metadata": self.metadata,
+        }
+        text = _canonical_json(payload)
+        for raw, esc in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026"),
+                         ("\u2028", "\\u2028"), ("\u2029", "\\u2029")):
+            text = text.replace(raw, esc)
+        return _compute_sha256(text.encode("utf-8"))
+
     def sign(self, secret_key: Optional[str]) -> None:
         self.entry_hash = self.compute_hash()
         if secret_key:
@@ -91,6 +107,8 @@ class StreamEntry:
 
     def verify_entry(self, secret_key: Optional[str] = None) -> Tuple[bool, str]:
         expected_hash = self.compute_hash()
+        if self.entry_hash != expected_hash and self.compute_legacy_go_hash() == self.entry_hash:
+            expected_hash = self.entry_hash  # accepted: wags-go 0.1.0 legacy encoding
         if self.entry_hash != expected_hash:
             return False, f"Hash mismatch: stored {self.entry_hash} != computed {expected_hash}"
         if secret_key and self.signature:
@@ -263,6 +281,8 @@ class WagsWorkspace:
         if not rev_dir.exists():
             raise ValueError(f"Review {review_id} not found")
 
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("metadata must be a JSON object (dict)")
         if resolves is not None or supersedes is not None:
             metadata = dict(metadata or {})
             if resolves is not None:
@@ -278,6 +298,12 @@ class WagsWorkspace:
                 elif isinstance(item, dict):
                     findings_dicts.append(item)
 
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("metadata must be a JSON object (dict)")
+        for fd in findings_dicts:
+            sev = fd.get("severity") if isinstance(fd, dict) else None
+            if not isinstance(sev, str) or sev.upper() not in VALID_SEVERITIES:
+                raise ValueError(f"invalid finding severity {sev!r}; must be one of {', '.join(VALID_SEVERITIES)}")
         md = metadata or {}
         if "resolves" in md or "supersedes" in md:
             stream_path = rev_dir / f"{reviewer_name}.jsonl"
@@ -398,6 +424,12 @@ class WagsWorkspace:
                             stream_valid = False
                             errors.append(f"Line {idx} sequence {entry.sequence}: {msg}")
 
+                        if entry.sequence != len(prior_dicts) + 1:
+                            stream_valid = False
+                            errors.append(f"Line {idx}: sequence {entry.sequence} out of order (expected {len(prior_dicts) + 1})")
+                        if entry.reviewer != reviewer:
+                            stream_valid = False
+                            errors.append(f"Line {idx}: reviewer '{entry.reviewer}' does not match stream '{reviewer}'")
                         # Validate resolution refs (own stream, earlier entries only)
                         res, sup = self._resolution_refs(d)
                         for msg2 in self._check_resolution_refs(prior_dicts, res, sup):
@@ -470,33 +502,32 @@ class WagsWorkspace:
     def _stream_state(cls, entries: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Return (latest_verdict, open_findings, resolved_findings) for one stream.
 
-        Rule: a finding is open unless a LATER entry in the same stream lists
-        its id in ``metadata.resolves`` or lists the hash of the entry that
-        raised it in ``metadata.supersedes``. Invalid refs are ignored here
+        Entries are processed in ``sequence`` order. A resolving entry at
+        position k closes only finding INSTANCES raised in entries before k:
+        ids in ``metadata.resolves`` and every finding of an entry named in
+        ``metadata.supersedes``. A finding id raised again after it was
+        resolved is a new, open instance. Invalid refs are ignored here
         (verify_review reports them).
         """
+        entries = sorted(entries, key=lambda e: e.get("sequence", 0))
         latest_verdict: Optional[str] = None
-        raised: List[Tuple[str, Dict[str, Any]]] = []  # (entry_hash, finding)
-        resolved_ids: set = set()
-        superseded_hashes: set = set()
+        instances: List[Dict[str, Any]] = []  # {"pos", "hash", "finding", "resolved"}
         for idx, d in enumerate(entries):
             resolves, supersedes = cls._resolution_refs(d)
             if not cls._check_resolution_refs(entries[:idx], resolves, supersedes):
-                resolved_ids.update(resolves)
-                superseded_hashes.update(supersedes)
+                res_ids, sup = set(resolves), set(supersedes)
+                for inst in instances:  # all instances are from earlier entries
+                    if inst["finding"].get("id") in res_ids or inst["hash"] in sup:
+                        inst["resolved"] = True
             if d.get("verdict"):
                 latest_verdict = d["verdict"]
             for finding in d.get("findings", []):
-                raised.append((d.get("entry_hash", ""), finding))
-        open_f, resolved_f = [], []
-        for h, finding in raised:
-            if finding.get("id") in resolved_ids or h in superseded_hashes:
-                resolved_f.append(finding)
-            else:
-                open_f.append(finding)
+                instances.append({"hash": d.get("entry_hash", ""), "finding": finding, "resolved": False})
+        open_f = [i["finding"] for i in instances if not i["resolved"]]
+        resolved_f = [i["finding"] for i in instances if i["resolved"]]
         return latest_verdict, open_f, resolved_f
 
-    def converge_review(self, review_id: str) -> Dict[str, Any]:
+    def converge_review(self, review_id: str, keys: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Compute consensus using each reviewer's latest verdict and open findings.
 
         - Verdict per reviewer = verdict of their latest entry that has one.
@@ -514,8 +545,22 @@ class WagsWorkspace:
         with open(target_file, "r", encoding="utf-8") as f:
             target_data = json.load(f)
 
+        verification = self.verify_review(review_id, keys)
+        registered: set = set()
+        reg_file = rev_dir / "reviewers.json"
+        if reg_file.exists():
+            with open(reg_file, "r", encoding="utf-8") as f:
+                registered = set(json.load(f).keys())
+        # Legacy: wags-go 0.1.0 never wrote reviewers.json entries. With an empty
+        # registry every stream is treated as registered (reported via registry_empty).
+        registry_empty = not registered
+        invalid_streams: List[Dict[str, Any]] = []
+        unregistered_streams: List[str] = []
+
         reviewer_latest_verdicts: Dict[str, str] = {}
         all_findings: List[Dict[str, Any]] = []
+        all_severity_counts = {"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
+        unknown_severity_findings: List[Dict[str, Any]] = []
         open_findings: List[Dict[str, Any]] = []
         resolved_findings: List[Dict[str, Any]] = []
         severity_counts = {"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
@@ -523,16 +568,30 @@ class WagsWorkspace:
 
         for path in sorted(rev_dir.glob("*.jsonl")):
             reviewer = path.stem
+            if not registry_empty and reviewer not in registered:
+                unregistered_streams.append(reviewer)
+                continue
+            sv = verification["streams"].get(reviewer, {})
+            if not sv.get("valid", False):
+                invalid_streams.append({"reviewer": reviewer, "errors": sv.get("errors", [])})
+                continue
             entries = self._read_stream_dicts(path)
             latest, open_f, resolved_f = self._stream_state(entries)
             if latest:
                 reviewer_latest_verdicts[reviewer] = latest
             for d in entries:
-                all_findings.extend(d.get("findings", []))
+                for finding in d.get("findings", []):
+                    all_findings.append(finding)
+                    s0 = str(finding.get("severity", "N")).upper()
+                    all_severity_counts[s0] = all_severity_counts.get(s0, 0) + 1
             resolved_findings.extend(resolved_f)
             for finding in open_f:
                 open_findings.append(finding)
                 sev = str(finding.get("severity", "N")).upper()
+                if sev not in VALID_SEVERITIES:
+                    # Unknown severity: treat conservatively as P0.
+                    unknown_severity_findings.append(finding)
+                    sev = "P0"
                 severity_counts[sev] = severity_counts.get(sev, 0) + 1
                 if sev == "P0" or (sev == "P1" and (latest or "").lower() != "approve"):
                     blocking_findings.append(finding)
@@ -543,10 +602,14 @@ class WagsWorkspace:
             normalized_v = v.lower()
             verdict_counts[normalized_v] = verdict_counts.get(normalized_v, 0) + 1
 
-        open_p0 = sum(1 for x in blocking_findings if str(x.get("severity", "")).upper() == "P0")
-        blocking_p1 = sum(1 for x in blocking_findings if str(x.get("severity", "")).upper() == "P1")
+        open_p0 = severity_counts.get("P0", 0)  # includes unknown severities (treated as P0)
+        blocking_p1 = len(blocking_findings) - open_p0
 
-        if open_p0 > 0 or verdict_counts.get("block", 0) > 0:
+        if invalid_streams:
+            overall_verdict = "BLOCK"
+            rationale = (f"Integrity failure: {len(invalid_streams)} registered stream(s) failed verification "
+                         f"({', '.join(x['reviewer'] for x in invalid_streams)}); excluded and review blocked.")
+        elif open_p0 > 0 or verdict_counts.get("block", 0) > 0:
             overall_verdict = "BLOCK"
             rationale = f"Blocked by {open_p0} open P0 finding(s) or explicit block vote."
         elif blocking_p1 > 0 or verdict_counts.get("request_changes", 0) > 0:
@@ -570,8 +633,13 @@ class WagsWorkspace:
             "summary": {
                 "total_reviewers": total_reviewers,
                 "verdicts": verdict_counts,
-                "findings_by_severity": severity_counts,
+                "findings_by_severity": all_severity_counts,
+                "open_findings_by_severity": severity_counts,
             },
+            "invalid_streams": invalid_streams,
+            "unregistered_streams": unregistered_streams,
+            "registry_empty": registry_empty,
+            "unknown_severity_findings": unknown_severity_findings,
             "blocking_findings": blocking_findings,
             "open_findings": open_findings,
             "resolved_findings": resolved_findings,

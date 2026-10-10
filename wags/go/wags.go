@@ -10,9 +10,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,22 +53,170 @@ func computeSHA256(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
-// canonicalJSON matches Python json.dumps(sort_keys=True, separators=(",", ":"),
-// ensure_ascii=False): no HTML escaping of <, >, & and raw U+2028/U+2029.
+// canonicalJSON reproduces Python's
+// json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+// byte for byte: keys sorted, no HTML escaping, non-ASCII (incl. U+2028/9)
+// emitted raw, and numbers emitted from their original literal (json.Number)
+// so Python floats such as 1.0, -0.0 and 1e-07 round-trip exactly.
 func canonicalJSON(v interface{}) ([]byte, error) {
 	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	if err := writeCanonical(&buf, v); err != nil {
 		return nil, err
 	}
-	out := buf.Bytes()
-	out = out[:len(out)-1] // drop trailing newline added by Encode
-	out = []byte(strings.NewReplacer(`\u2028`, "\u2028", `\u2029`, "\u2029").Replace(string(out)))
-	return out, nil
+	return buf.Bytes(), nil
+}
+
+func writeCanonicalString(buf *bytes.Buffer, s string) {
+	buf.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			buf.WriteString(`\"`)
+		case '\\':
+			buf.WriteString(`\\`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(buf, `\u%04x`, r)
+			} else {
+				buf.WriteRune(r)
+			}
+		}
+	}
+	buf.WriteByte('"')
+}
+
+func pyFloat(f float64) string {
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		if math.IsNaN(f) {
+			return "NaN"
+		} else if f > 0 {
+			return "Infinity"
+		}
+		return "-Infinity"
+	}
+	if f == math.Trunc(f) && math.Abs(f) < 1e16 {
+		s := strconv.FormatFloat(f, 'f', -1, 64)
+		if math.Signbit(f) && f == 0 {
+			s = "-0"
+		}
+		return s + ".0"
+	}
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	// Python writes exponents with at least two digits: 1e-07
+	if i := strings.IndexAny(s, "e"); i >= 0 {
+		mant, exp := s[:i], s[i+1:]
+		sign := "+"
+		if exp[0] == '-' || exp[0] == '+' {
+			sign, exp = exp[:1], exp[1:]
+		}
+		if len(exp) < 2 {
+			exp = "0" + exp
+		}
+		s = mant + "e" + sign + exp
+	}
+	return s
+}
+
+func writeCanonical(buf *bytes.Buffer, v interface{}) error {
+	switch x := v.(type) {
+	case nil:
+		buf.WriteString("null")
+	case bool:
+		if x {
+			buf.WriteString("true")
+		} else {
+			buf.WriteString("false")
+		}
+	case string:
+		writeCanonicalString(buf, x)
+	case json.Number:
+		buf.WriteString(string(x))
+	case int:
+		buf.WriteString(strconv.Itoa(x))
+	case int64:
+		buf.WriteString(strconv.FormatInt(x, 10))
+	case float64:
+		buf.WriteString(pyFloat(x))
+	case []interface{}:
+		buf.WriteByte('[')
+		for i, e := range x {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := writeCanonical(buf, e); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	case []string:
+		arr := make([]interface{}, len(x))
+		for i := range x {
+			arr[i] = x[i]
+		}
+		return writeCanonical(buf, arr)
+	case []map[string]interface{}:
+		arr := make([]interface{}, len(x))
+		for i := range x {
+			arr[i] = x[i]
+		}
+		return writeCanonical(buf, arr)
+	case map[string]interface{}:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys) // Python sorts by code point; Go sorts by UTF-8 bytes (same order)
+		buf.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			writeCanonicalString(buf, k)
+			buf.WriteByte(':')
+			if err := writeCanonical(buf, x[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	default:
+		// Fall back via a JSON round-trip with UseNumber.
+		raw, err := json.Marshal(x)
+		if err != nil {
+			return err
+		}
+		var g interface{}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&g); err != nil {
+			return err
+		}
+		return writeCanonical(buf, g)
+	}
+	return nil
+}
+
+// decodeEntry parses one JSONL line preserving numeric literals.
+func decodeEntry(line string, e *StreamEntry) error {
+	dec := json.NewDecoder(strings.NewReader(line))
+	dec.UseNumber()
+	return dec.Decode(e)
 }
 
 func computeEntryHash(entry *StreamEntry) (string, error) {
+	return computeSHA256OfPayload(entryPayload(entry), false)
+}
+
+func entryPayload(entry *StreamEntry) map[string]interface{} {
 	payload := map[string]interface{}{
 		"sequence":    entry.Sequence,
 		"timestamp":   entry.Timestamp,
@@ -91,12 +241,24 @@ func computeEntryHash(entry *StreamEntry) (string, error) {
 	if entry.Findings == nil {
 		payload["findings"] = []map[string]interface{}{}
 	}
+	return payload
+}
 
-	bytes, err := canonicalJSON(payload)
+// computeSHA256OfPayload hashes the payload. legacy=true reproduces the
+// wags-go 0.1.0 encoding (encoding/json.Marshal: HTML-escaped <, >, & and
+// escaped U+2028/U+2029), accepted on verify only.
+func computeSHA256OfPayload(payload map[string]interface{}, legacy bool) (string, error) {
+	var b []byte
+	var err error
+	if legacy {
+		b, err = json.Marshal(payload)
+	} else {
+		b, err = canonicalJSON(payload)
+	}
 	if err != nil {
 		return "", err
 	}
-	return computeSHA256(bytes), nil
+	return computeSHA256(b), nil
 }
 
 func signEntry(entry *StreamEntry, secretKey string) error {
@@ -119,6 +281,11 @@ func verifyEntry(entry *StreamEntry, secretKey string) (bool, string) {
 	expectedHash, err := computeEntryHash(entry)
 	if err != nil {
 		return false, fmt.Sprintf("Hash calculation error: %v", err)
+	}
+	if entry.EntryHash != expectedHash {
+		if legacy, lerr := computeSHA256OfPayload(entryPayload(entry), true); lerr == nil && legacy == entry.EntryHash {
+			expectedHash = legacy // accepted: wags-go 0.1.0 legacy encoding
+		}
 	}
 	if entry.EntryHash != expectedHash {
 		return false, fmt.Sprintf("Hash mismatch: stored %s != computed %s", entry.EntryHash, expectedHash)
@@ -226,6 +393,19 @@ func (ws *WagsWorkspace) RegisterReviewer(reviewID, reviewerName, secretKey, rol
 	if _, err := os.Stat(revDir); os.IsNotExist(err) {
 		return fmt.Errorf("review %s not found", reviewID)
 	}
+	regFile := filepath.Join(revDir, "reviewers.json")
+	reg := map[string]interface{}{}
+	if b, err := os.ReadFile(regFile); err == nil {
+		_ = json.Unmarshal(b, &reg)
+	}
+	reg[reviewerName] = map[string]interface{}{
+		"registered_at": time.Now().UTC().Format("2006-01-02T15:04:05.000000Z"),
+		"role":          role,
+		"has_hmac":      secretKey != "",
+	}
+	if b, err := json.MarshalIndent(reg, "", "  "); err == nil {
+		_ = os.WriteFile(regFile, b, 0644)
+	}
 	streamPath := filepath.Join(revDir, reviewerName+".jsonl")
 	if _, err := os.Stat(streamPath); os.IsNotExist(err) {
 		f, err := os.Create(streamPath)
@@ -258,7 +438,7 @@ func (ws *WagsWorkspace) SubmitEntryWithMetadata(reviewID, reviewerName, phase s
 				continue
 			}
 			var prev StreamEntry
-			if err := json.Unmarshal([]byte(line), &prev); err == nil {
+			if err := decodeEntry(line, &prev); err == nil {
 				if prev.Sequence > lastSeq {
 					lastSeq = prev.Sequence
 				}
@@ -272,7 +452,14 @@ func (ws *WagsWorkspace) SubmitEntryWithMetadata(reviewID, reviewerName, phase s
 	if metadata == nil {
 		metadata = map[string]interface{}{}
 	}
-	if _, ok := metadata["resolves"]; ok || metadata["supersedes"] != nil {
+	for _, f := range findings {
+		if !validSeverity(f.Severity) {
+			return nil, fmt.Errorf("invalid finding severity %q; must be one of P0, P1, P2, P3, N", f.Severity)
+		}
+	}
+	_, hasRes := metadata["resolves"]
+	_, hasSup := metadata["supersedes"]
+	if hasRes || hasSup {
 		prior, _ := readStream(streamPath)
 		if errs := checkResolutionRefs(prior, metadata); len(errs) > 0 {
 			return nil, fmt.Errorf("%s", strings.Join(errs, "; "))
@@ -348,7 +535,7 @@ func (ws *WagsWorkspace) TailReview(reviewID string) ([]StreamEntry, error) {
 				continue
 			}
 			var entry StreamEntry
-			if err := json.Unmarshal([]byte(line), &entry); err == nil {
+			if err := decodeEntry(line, &entry); err == nil {
 				all = append(all, entry)
 			}
 		}
@@ -395,7 +582,7 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 				continue
 			}
 			var entry StreamEntry
-			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			if err := decodeEntry(line, &entry); err != nil {
 				valid = false
 				errorsList = append(errorsList, fmt.Sprintf("%s line %d: JSON parse error", reviewer, idx+1))
 				continue
@@ -412,6 +599,14 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 			if !ok {
 				valid = false
 				errorsList = append(errorsList, fmt.Sprintf("%s line %d: %s", reviewer, idx+1, msg))
+			}
+			if entry.Sequence != len(prior)+1 {
+				valid = false
+				errorsList = append(errorsList, fmt.Sprintf("%s line %d: sequence %d out of order (expected %d)", reviewer, idx+1, entry.Sequence, len(prior)+1))
+			}
+			if entry.Reviewer != reviewer {
+				valid = false
+				errorsList = append(errorsList, fmt.Sprintf("%s line %d: reviewer '%s' does not match stream", reviewer, idx+1, entry.Reviewer))
 			}
 			for _, m := range checkResolutionRefs(prior, entry.Metadata) {
 				valid = false
@@ -436,7 +631,7 @@ func readStream(path string) ([]StreamEntry, error) {
 			continue
 		}
 		var e StreamEntry
-		if err := json.Unmarshal([]byte(line), &e); err == nil {
+		if err := decodeEntry(line, &e); err == nil {
 			out = append(out, e)
 		}
 	}
@@ -483,7 +678,9 @@ func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []strin
 			}
 		}
 	}
-	if res, ok := stringList(md["resolves"]); !ok {
+	if v, present := md["resolves"]; present && v == nil {
+		errs = append(errs, "metadata.resolves must be a list of finding id strings")
+	} else if res, ok := stringList(md["resolves"]); !ok {
 		errs = append(errs, "metadata.resolves must be a list of finding id strings")
 	} else {
 		for _, id := range res {
@@ -492,7 +689,9 @@ func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []strin
 			}
 		}
 	}
-	if sup, ok := stringList(md["supersedes"]); !ok {
+	if v, present := md["supersedes"]; present && v == nil {
+		errs = append(errs, "metadata.supersedes must be a list of entry_hash strings")
+	} else if sup, ok := stringList(md["supersedes"]); !ok {
 		errs = append(errs, "metadata.supersedes must be a list of entry_hash strings")
 	} else {
 		for _, h := range sup {
@@ -504,41 +703,60 @@ func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []strin
 	return errs
 }
 
-// streamState returns latest verdict, open findings, resolved findings.
-func streamState(entries []StreamEntry) (string, []map[string]interface{}, []map[string]interface{}) {
-	latest := ""
-	resolvedIDs := map[string]bool{}
-	supHashes := map[string]bool{}
-	type raisedF struct {
-		hash string
-		f    map[string]interface{}
+func validSeverity(sev string) bool {
+	switch strings.ToUpper(sev) {
+	case "P0", "P1", "P2", "P3", "N":
+		return true
 	}
-	var raised []raisedF
+	return false
+}
+
+// streamState returns latest verdict, open findings, resolved findings.
+// Entries are processed in sequence order; a resolving entry closes only
+// finding instances raised in EARLIER entries, so an id re-raised after it
+// was resolved is open again. Mirrors Python _stream_state.
+func streamState(entries []StreamEntry) (string, []map[string]interface{}, []map[string]interface{}) {
+	entries = append([]StreamEntry(nil), entries...)
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Sequence < entries[j].Sequence })
+	latest := ""
+	type inst struct {
+		hash     string
+		f        map[string]interface{}
+		resolved bool
+	}
+	var insts []*inst
 	for idx, e := range entries {
-		if len(checkResolutionRefs(entries[:idx], e.Metadata)) == 0 && e.Metadata != nil {
+		if e.Metadata != nil && len(checkResolutionRefs(entries[:idx], e.Metadata)) == 0 {
 			res, _ := stringList(e.Metadata["resolves"])
 			sup, _ := stringList(e.Metadata["supersedes"])
-			for _, id := range res {
-				resolvedIDs[id] = true
+			ids := map[string]bool{}
+			hs := map[string]bool{}
+			for _, x := range res {
+				ids[x] = true
 			}
-			for _, h := range sup {
-				supHashes[h] = true
+			for _, x := range sup {
+				hs[x] = true
+			}
+			for _, in := range insts {
+				id, _ := in.f["id"].(string)
+				if ids[id] || hs[in.hash] {
+					in.resolved = true
+				}
 			}
 		}
 		if e.Verdict != "" {
 			latest = e.Verdict
 		}
 		for _, f := range e.Findings {
-			raised = append(raised, raisedF{e.EntryHash, f})
+			insts = append(insts, &inst{hash: e.EntryHash, f: f})
 		}
 	}
 	var open, resolved []map[string]interface{}
-	for _, r := range raised {
-		id, _ := r.f["id"].(string)
-		if resolvedIDs[id] || supHashes[r.hash] {
-			resolved = append(resolved, r.f)
+	for _, in := range insts {
+		if in.resolved {
+			resolved = append(resolved, in.f)
 		} else {
-			open = append(open, r.f)
+			open = append(open, in.f)
 		}
 	}
 	return latest, open, resolved
@@ -560,6 +778,16 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	}
 	sort.Strings(matches)
 
+	_, verrs, _ := ws.VerifyReview(reviewID, nil)
+	registered := map[string]interface{}{}
+	if b, err := os.ReadFile(filepath.Join(revDir, "reviewers.json")); err == nil {
+		_ = json.Unmarshal(b, &registered)
+	}
+	invalidStreams := []map[string]interface{}{}
+	unregisteredStreams := []string{}
+	unknownSev := []map[string]interface{}{}
+	allSeverityCounts := map[string]int{"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
+
 	reviewerVerdicts := map[string]string{}
 	severityCounts := map[string]int{"P0": 0, "P1": 0, "P2": 0, "P3": 0, "N": 0}
 	blockingFindings := []map[string]interface{}{}
@@ -569,9 +797,28 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 
 	for _, m := range matches {
 		reviewer := strings.TrimSuffix(filepath.Base(m), ".jsonl")
+		if _, ok := registered[reviewer]; !ok && len(registered) > 0 {
+			unregisteredStreams = append(unregisteredStreams, reviewer)
+			continue
+		}
+		var serrs []string
+		for _, e := range verrs {
+			if strings.HasPrefix(e, reviewer+" line ") {
+				serrs = append(serrs, e)
+			}
+		}
+		if len(serrs) > 0 {
+			invalidStreams = append(invalidStreams, map[string]interface{}{"reviewer": reviewer, "errors": serrs})
+			continue
+		}
 		entries, err := readStream(m)
 		if err != nil {
 			continue
+		}
+		for _, e := range entries {
+			for _, f := range e.Findings {
+				allSeverityCounts[strings.ToUpper(fmt.Sprintf("%v", f["severity"]))]++
+			}
 		}
 		latest, open, resolved := streamState(entries)
 		if latest != "" {
@@ -581,6 +828,10 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		for _, f := range open {
 			openFindings = append(openFindings, f)
 			sev := strings.ToUpper(fmt.Sprintf("%v", f["severity"]))
+			if !validSeverity(sev) {
+				unknownSev = append(unknownSev, f) // treated conservatively as P0
+				sev = "P0"
+			}
 			severityCounts[sev]++
 			if sev == "P0" {
 				openP0++
@@ -601,7 +852,14 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	overallVerdict := "DEFER"
 	rationale := "Insufficient quorum or inconclusive vote."
 
-	if openP0 > 0 || verdictCounts["block"] > 0 {
+	if len(invalidStreams) > 0 {
+		names := []string{}
+		for _, x := range invalidStreams {
+			names = append(names, x["reviewer"].(string))
+		}
+		overallVerdict = "BLOCK"
+		rationale = fmt.Sprintf("Integrity failure: %d registered stream(s) failed verification (%s); excluded and review blocked.", len(invalidStreams), strings.Join(names, ", "))
+	} else if openP0 > 0 || verdictCounts["block"] > 0 {
 		overallVerdict = "BLOCK"
 		rationale = fmt.Sprintf("Blocked by %d open P0 finding(s) or explicit block vote.", openP0)
 	} else if blockingP1 > 0 || verdictCounts["request_changes"] > 0 {
@@ -621,13 +879,18 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		"rationale":        rationale,
 		"quorum_met":       totalReviewers > 0,
 		"summary": map[string]interface{}{
-			"total_reviewers":      totalReviewers,
-			"verdicts":             verdictCounts,
-			"findings_by_severity": severityCounts,
+			"total_reviewers":           totalReviewers,
+			"verdicts":                  verdictCounts,
+			"findings_by_severity":      allSeverityCounts,
+			"open_findings_by_severity": severityCounts,
 		},
-		"blocking_findings": blockingFindings,
-		"open_findings":     openFindings,
-		"resolved_findings": resolvedFindings,
+		"invalid_streams":           invalidStreams,
+		"unregistered_streams":      unregisteredStreams,
+		"registry_empty":            len(registered) == 0,
+		"unknown_severity_findings": unknownSev,
+		"blocking_findings":         blockingFindings,
+		"open_findings":             openFindings,
+		"resolved_findings":         resolvedFindings,
 	}
 
 	data, _ := json.MarshalIndent(converged, "", "  ")
