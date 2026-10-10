@@ -556,3 +556,52 @@ func TestGoParallelConverge(t *testing.T) {
 		}
 	}
 }
+
+func TestGoMinQuorumEmptyAndHuge(t *testing.T) {
+	for _, bad := range []string{"", "100000000000000000000", "1000001"} {
+		_, err := ParseMinQuorum(bad)
+		want := "min_quorum must be a positive integer (1..1000000); got '" + bad + "'"
+		if err == nil || err.Error() != want {
+			t.Fatalf("%q: got %v", bad, err)
+		}
+	}
+	if err := ValidateMinQuorum(intPtr(MaxMinQuorum + 1)); err == nil {
+		t.Fatal("API above MaxMinQuorum must be rejected")
+	}
+}
+
+func TestGoConvergeWriteFailurePropagates(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	revDir := filepath.Join(ws.ReviewsDir, rid)
+	_ = os.Mkdir(filepath.Join(revDir, "converged.json"), 0755)
+	if _, err := ws.ConvergeReview(rid); err == nil || !strings.Contains(err.Error(), "failed to write converged.json") {
+		t.Fatalf("expected write error, got %v", err)
+	}
+	ents, _ := os.ReadDir(revDir)
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestGoAtomicWriteRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.json")
+	if err := atomicWriteFile(p, []byte(`{"ok":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(p, []byte(`{"ok":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	if string(b) != `{"ok":2}` {
+		t.Fatalf("got %s", b)
+	}
+	if err := atomicWriteFile(filepath.Join(dir, "missing", "x.json"), []byte("{}")); err == nil {
+		t.Fatal("write into missing dir must error")
+	}
+}

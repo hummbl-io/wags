@@ -18,24 +18,29 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = "0.2.0"
+MAX_MIN_QUORUM = 1_000_000  # same bound in Go; larger values are rejected, not DEFERred
+
+
 def validate_min_quorum(value: Any) -> Optional[int]:
-    """None (default: all registered reviewers) or an int >= 1. Rejects bools,
-    floats, strings, 0 and negatives. Identical rule in Go."""
+    """None (default: all registered reviewers) or an int in 1..MAX_MIN_QUORUM. Rejects
+    bools, floats, strings, 0, negatives and oversized values. Identical rule in Go."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"min_quorum must be a positive integer (>= 1); got {value!r}")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > MAX_MIN_QUORUM:
+        raise ValueError(f"min_quorum must be a positive integer (1..{MAX_MIN_QUORUM}); got {value!r}")
     return value
 
 
 def _cli_min_quorum(text: str) -> int:
+    """CLI parser; identical rule and message to Go ParseMinQuorum (empty string rejected)."""
     import argparse
-    if not (text.isascii() and text.isdigit()):
-        raise argparse.ArgumentTypeError(f"min_quorum must be a positive integer (>= 1); got {text!r}")
+    msg = f"min_quorum must be a positive integer (1..{MAX_MIN_QUORUM}); got '{text}'"
+    if not (text.isascii() and text.isdigit()) or len(text) > 7:
+        raise argparse.ArgumentTypeError(msg)
     try:
         return validate_min_quorum(int(text))  # type: ignore[return-value]
-    except ValueError as ex:
-        raise argparse.ArgumentTypeError(str(ex))
+    except ValueError:
+        raise argparse.ArgumentTypeError(msg)
 
 
 VALID_SEVERITIES = ("P0", "P1", "P2", "P3", "N")
@@ -47,17 +52,48 @@ def _canonical_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _fsync_dir(directory: Path) -> None:
+    """fsync a directory so a rename is durable (POSIX). No-op where unsupported (Windows)."""
+    import os
+    flags = getattr(os, "O_DIRECTORY", None)
+    if flags is None:
+        return
+    try:
+        dfd = os.open(str(directory), os.O_RDONLY | flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     """Write JSON via temp file + os.replace so concurrent readers never see a partial file."""
     import os
     import tempfile
     path = Path(path)
+    import time
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
+        # Windows: replacing a file another process holds open raises PermissionError.
+        # Retry briefly (~1s), then fail loudly rather than silently skipping the write.
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+        _fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -1041,7 +1077,11 @@ def main() -> int:
             return 1
 
     elif args.command == "converge":
-        res = ws.converge_review(args.review_id, min_quorum=args.min_quorum)
+        try:
+            res = ws.converge_review(args.review_id, min_quorum=args.min_quorum)
+        except OSError as ex:
+            print(f"Error: failed to write convergence result: {ex}", file=sys.stderr)
+            return 1
         print(f"=== wags Convergence Report: {args.review_id} ===")
         print(f"Overall Verdict: {res['overall_verdict']}")
         print(f"Rationale:       {res['rationale']}")

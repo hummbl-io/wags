@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,7 +52,8 @@ type StreamEntry struct {
 // atomicWriteFile writes via a temp file + rename so concurrent readers never
 // observe a partially written file. Mirrors Python _atomic_write_json.
 func atomicWriteFile(path string, data []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -61,12 +63,47 @@ func atomicWriteFile(path string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return err
 	}
 	_ = os.Chmod(tmp, 0644)
-	return os.Rename(tmp, path)
+	// Windows: renaming over a file another process holds open fails with an
+	// access error. Retry briefly (~1s), then return the error (never drop it).
+	var rerr error
+	for attempt := 0; attempt < 20; attempt++ {
+		if rerr = os.Rename(tmp, path); rerr == nil {
+			break
+		}
+		if runtime.GOOS != "windows" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if rerr != nil {
+		os.Remove(tmp)
+		return rerr
+	}
+	fsyncDir(dir)
+	return nil
+}
+
+// fsyncDir makes the rename durable on POSIX; best effort / no-op on Windows.
+func fsyncDir(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	d.Close()
 }
 
 func computeSHA256(data []byte) string {
@@ -976,32 +1013,36 @@ func filterContains(xs []string, sub string) []string {
 	return out
 }
 
-// ValidateMinQuorum: nil (default: all registered) or an integer >= 1.
+// MaxMinQuorum bounds min_quorum (same as Python MAX_MIN_QUORUM).
+const MaxMinQuorum = 1000000
+
+// ValidateMinQuorum: nil (default: all registered) or an integer in 1..MaxMinQuorum.
 func ValidateMinQuorum(v *int) error {
-	if v != nil && *v < 1 {
-		return fmt.Errorf("min_quorum must be a positive integer (>= 1); got %d", *v)
+	if v != nil && (*v < 1 || *v > MaxMinQuorum) {
+		return fmt.Errorf("min_quorum must be a positive integer (1..%d); got %d", MaxMinQuorum, *v)
 	}
 	return nil
 }
 
-// ParseMinQuorum parses a CLI value with the same rule as Python: ASCII digits only, >= 1.
+// ParseMinQuorum parses an explicitly supplied CLI value with the same rule and
+// message as Python: ASCII digits only, 1..MaxMinQuorum. An empty string is rejected.
 func ParseMinQuorum(text string) (*int, error) {
-	if text == "" {
-		return nil, nil
+	bad := fmt.Errorf("min_quorum must be a positive integer (1..%d); got '%s'", MaxMinQuorum, text)
+	if text == "" || len(text) > 7 {
+		return nil, bad
 	}
 	for _, r := range text {
 		if r < '0' || r > '9' {
-			return nil, fmt.Errorf("min_quorum must be a positive integer (>= 1); got %q", text)
+			return nil, bad
 		}
 	}
 	n, err := strconv.Atoi(text)
-	if err != nil || n < 1 {
-		return nil, fmt.Errorf("min_quorum must be a positive integer (>= 1); got %q", text)
+	if err != nil || n < 1 || n > MaxMinQuorum {
+		return nil, bad
 	}
 	return &n, nil
 }
 
-// ConvergeReviewOpts: minQuorum < 0 means "every registered reviewer must vote".
 // ConvergeReviewOpts: minQuorum nil = every registered reviewer must vote; otherwise >= 1.
 func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum *int) (map[string]interface{}, error) {
 	if err := ValidateMinQuorum(minQuorum); err != nil {
@@ -1344,7 +1385,9 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum *int) (ma
 	}
 
 	data, _ := json.MarshalIndent(converged, "", "  ")
-	_ = atomicWriteFile(filepath.Join(revDir, "converged.json"), data)
+	if err := atomicWriteFile(filepath.Join(revDir, "converged.json"), data); err != nil {
+		return nil, fmt.Errorf("failed to write converged.json: %w", err)
+	}
 
 	return converged, nil
 }
@@ -1400,10 +1443,20 @@ func main() {
 		convCmd := flag.NewFlagSet("converge", flag.ExitOnError)
 		minQ := convCmd.String("min-quorum", "", "Minimum reviewers with a verdict before APPROVE, integer >= 1 (default: all registered)")
 		_ = convCmd.Parse(os.Args[3:])
-		mq, perr := ParseMinQuorum(*minQ)
-		if perr != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", perr)
-			os.Exit(2)
+		var mq *int
+		provided := false
+		convCmd.Visit(func(fl *flag.Flag) {
+			if fl.Name == "min-quorum" {
+				provided = true
+			}
+		})
+		if provided { // an explicitly supplied value (even '') must validate
+			var perr error
+			mq, perr = ParseMinQuorum(*minQ)
+			if perr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", perr)
+				os.Exit(2)
+			}
 		}
 		conv, err := ws.ConvergeReviewOpts(os.Args[2], mq)
 		if err != nil {

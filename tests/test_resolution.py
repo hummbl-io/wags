@@ -750,3 +750,93 @@ class TestConcurrentConverge(unittest.TestCase):
             json.loads((Path(tmp) / "reviews" / rid / "converged.json").read_text())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestReviewRound6(unittest.TestCase):
+    """Round-5 P3s: min_quorum CLI parity, durable/loud writes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wags_r6_")
+        self.ws = WagsWorkspace(self.tmp)
+        t = Path(self.tmp) / "t.md"
+        t.write_text("x")
+        self.rid = self.ws.init_review(t, review_id="rev-r6")["review_id"]
+        for r in ("a", "b"):
+            self.ws.register_reviewer(self.rid, r)
+            self.ws.submit_entry(self.rid, r, verdict="approve")
+        self.dir = Path(self.tmp) / "reviews" / self.rid
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cli(self, *args):
+        import sys
+        py = subprocess.run([sys.executable, "-c", "import sys,wags; sys.exit(wags.main())",
+                             "--workspace", self.tmp, "converge", self.rid, *args],
+                            capture_output=True, text=True, timeout=60)
+        if shutil.which("go") is None:
+            return py, None
+        import os
+        go = subprocess.run(["go", "run", "wags.go", "converge", self.rid, *args], cwd=GO_DIR,
+                            env=dict(os.environ, WAGS_WORKSPACE=self.tmp), capture_output=True, text=True, timeout=120)
+        return py, go
+
+    def test_empty_and_huge_min_quorum_rejected_same_message(self):
+        for bad in ("", "100000000000000000000", "1000001"):
+            py, _ = self._cli("--min-quorum", bad)
+            go = shutil.which("go")
+            want = f"min_quorum must be a positive integer (1..1000000); got '{bad}'"
+            self.assertNotEqual(py.returncode, 0)
+            self.assertIn(want, py.stderr)
+            if go is not None:
+                go = subprocess.run(["go", "run", "wags.go", "converge", self.rid, "-min-quorum", bad], cwd=GO_DIR,
+                                    env=dict(__import__("os").environ, WAGS_WORKSPACE=self.tmp),
+                                    capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(go.returncode, 0, bad)
+                self.assertIn(want, go.stderr)
+        with self.assertRaises(ValueError):
+            self.ws.converge_review(self.rid, min_quorum=10 ** 20)
+        self.assertEqual(self.ws.converge_review(self.rid, min_quorum=1_000_000)["overall_verdict"], "DEFER")
+
+    def test_converge_write_failure_is_loud(self):
+        (self.dir / "converged.json").mkdir()  # rename over a directory fails
+        with self.assertRaises(OSError):
+            self.ws.converge_review(self.rid)
+        py, go = self._cli()
+        self.assertNotEqual(py.returncode, 0)
+        self.assertIn("failed to write", py.stderr)
+        if go is not None:
+            self.assertNotEqual(go.returncode, 0)
+            self.assertIn("failed to write converged.json", go.stderr)
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_atomic_write_fsyncs_and_retries_on_permission_error(self):
+        import os
+        import wags as W
+        calls = {"fsync": 0, "replace": 0}
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fake_fsync(fd):
+            calls["fsync"] += 1
+            return real_fsync(fd)
+
+        def flaky_replace(a, b):
+            calls["replace"] += 1
+            if calls["replace"] < 3:
+                raise PermissionError("held open (simulated Windows)")
+            return real_replace(a, b)
+        target = Path(self.tmp) / "x.json"
+        from unittest import mock
+        with mock.patch.object(os, "fsync", fake_fsync), mock.patch.object(os, "replace", flaky_replace):
+            W._atomic_write_json(target, {"ok": 1})
+        self.assertEqual(json.loads(target.read_text()), {"ok": 1})
+        self.assertGreaterEqual(calls["fsync"], 1)
+        self.assertEqual(calls["replace"], 3)
+
+        def always_fail(a, b):
+            raise PermissionError("held open forever")
+        with mock.patch.object(os, "replace", always_fail), mock.patch("time.sleep", lambda s: None):
+            with self.assertRaises(PermissionError):
+                W._atomic_write_json(target, {"ok": 2})
+        self.assertEqual(json.loads(target.read_text()), {"ok": 1})
+        self.assertEqual([p.name for p in Path(self.tmp).iterdir() if p.name.endswith(".tmp")], [])
