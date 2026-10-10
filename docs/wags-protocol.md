@@ -137,7 +137,8 @@ Each line is a JSON object with cryptographic chaining:
   - the registry is empty or missing;
   - **no 0.2.0 marker** exists anywhere: no entry uses `resolves`/`supersedes`, `index.json` (workspace or per-review entry) doesn't declare 0.2.0, `converged.json` doesn't record a 0.2.0 `anchor_context` or `registry_mode: "registered"`, and `converged.json` isn't unparseable.
   - Once registered mode has been recorded, a review **never** falls back to legacy.
-  - Editing `target.json` to 0.1.0 and emptying the registry therefore cannot downgrade a 0.2.0 review. Without an anchor it fails closed through the index marker and registration rules. With an anchor it's a recorded downgrade, so **BLOCK**.
+  - **Hash-chained marker:** every new entry in a review whose target is not 0.1.0 carries `metadata.wags_protocol: "0.2.0"`, which `entry_hash` covers. Entries in 0.1.0 reviews stay unmarked, so old reviews can continue. Any chained marker counts as a 0.2.0 marker. On a 0.1.0 target it is reported as a protocol downgrade and gives **BLOCK**.
+  - Editing `target.json` to 0.1.0 and emptying the registry therefore can't downgrade a 0.2.0 review, **as long as the streams themselves aren't rewritten**. Scrubbing `index.json` or editing `converged.json` isn't enough, because the markers sit inside the hash-chained entries. Removing them means recomputing every entry hash, which is the general "unsigned files can be regenerated" limit in 4.6.
 - **Integrity.** Streams that fail verification are excluded, listed in `invalid_streams`, and force **`BLOCK`**. Verification covers bad hashes, broken `prev_hash` links, `sequence` not 1..n in file order, `reviewer` not matching the stream, invalid resolution refs, unregistered entries, and disallowed legacy hashes.
   - **Availability caveat:** because of this, anyone who can write a registered reviewer's file (or add an unregistered one) can **stall** a review with garbage. That is a deliberate fail-closed trade-off: wags prefers a stuck review to a silently wrong approval. An operator must repair or remove the stream.
 - **Regressions and anchor problems.** If any stream regressed since the last anchor (4.6), or there is any anchor/protocol problem (4.6), the verdict is **`BLOCK`**. Streams are listed in `regressed_streams`, and other problems in `anchor_problems`; both are also stated in `rationale`. So a gate that reads only `overall_verdict` still stops.
@@ -152,7 +153,14 @@ Rules, in order:
 1. **P0 Rule (Absolute Veto)**: any **open** `P0`, or any latest verdict `block`, gives **`BLOCK`**. Findings with an unrecognised severity are treated as `P0` (listed in `unknown_severity_findings`). Implementations reject unknown severities at submit.
 2. **P1 Rule**: any latest verdict `request_changes`, or any **open** `P1` whose reviewer's latest verdict is not `approve`, gives **`REQUEST_CHANGES`**.
    - **Policy change from 0.1.0:** an open P1 raised by a reviewer whose latest verdict is `approve` **no longer blocks**. That reviewer has accepted their own finding as non-blocking. The finding still appears in `open_findings` and `open_findings_by_severity`. To keep it blocking, the reviewer should vote `request_changes`.
-3. **Quorum**: by default **every registered reviewer** must have a latest verdict before the review can be `APPROVE`. Until then the result is **`DEFER`** ("pending quorum"). BLOCK and REQUEST_CHANGES are still reported immediately. An explicit `min_quorum` (Python `converge_review(..., min_quorum=N)`, CLI `--min-quorum N`, Go `ConvergeReviewOpts(id, N)` / `converge <id> -min-quorum N`) lowers the requirement to N voters. In legacy mode the default is the number of voters. Output: `quorum {required, voted, registered, min_quorum}` and `quorum_met`.
+3. **Quorum**: by default **every registered reviewer** must have a latest verdict before the review can be `APPROVE`. Until then the result is **`DEFER`** ("pending quorum"). BLOCK and REQUEST_CHANGES are still reported immediately.
+   - **A `defer` vote counts toward quorum.** It is a verdict.
+   - **A registered reviewer who never votes stalls the review forever** (DEFER). The remedies are an explicit `min_quorum`, or de-registering that reviewer **before the first anchor**. After an anchor, de-registering is a recorded regression and gives BLOCK.
+   - **`min_quorum`:** Python `converge_review(..., min_quorum=N)`, CLI `--min-quorum N`, Go `ConvergeReviewOpts(id, &n)` / `converge <id> -min-quorum N`. It must be an **integer >= 1**. `0`, negatives, floats (`1.5`, `2.0`), booleans and strings (`"2"`, `"abc"`) are **rejected** with "min_quorum must be a positive integer (>= 1)". The CLIs accept only ASCII digits. Python and Go apply the same rule.
+   - A `min_quorum` **above the registered count** isn't rejected. The result is **`DEFER`** with `quorum.warning` explaining that quorum can never be met.
+   - In legacy mode the default is the number of voters.
+   - Output: `quorum {required, voted, registered, min_quorum (the validated integer or null), warning}` and `quorum_met`.
+   - **`min_quorum` is a caller-side setting.** Whoever runs converge chooses it, and it isn't stored in the review. Gates that act on `overall_verdict` should also check `quorum.min_quorum` (and `quorum.required` against `quorum.registered`) in `converged.json`, so a lowered quorum isn't accepted unnoticed.
 4. **Majority Approval**: if there are no blockers and at least 50% of reviewers with a verdict submit `approve`, the verdict is **`APPROVE`**.
 5. **Tie / Inconclusive**: otherwise **`DEFER`**.
 
@@ -209,13 +217,22 @@ Any regression forces **`BLOCK`**, and the stream is listed in `regressed_stream
   - a change from `registered` to `legacy_all_streams`;
   - a recorded registered reviewer missing from `reviewers.json`.
 - The old context is kept while a problem persists.
-- `anchor_status` is `absent` (first converge), `present`, or `unparseable`. **Unparseable fails closed**: it gives BLOCK and sets `anchor_lost: true`, which is carried forward, so every later converge blocks until an operator reviews it. (Deleting `converged.json` clears this; see the limits.)
+- `anchor_status` is `absent` (first converge), `present`, `present_no_context` (an older `converged.json` without `anchor_context`, e.g. written by an earlier build; stream anchors are still checked), or `unparseable`. **Unparseable fails closed**: it gives BLOCK and sets `anchor_lost: true`, which is carried forward, so every later converge blocks until an operator reviews it. (Deleting `converged.json` clears this; see the limits.)
+
+**Concurrency.** `converged.json`, `target.json`, `index.json` and `reviewers.json` are written atomically (temp file + rename), so a concurrent reader never sees a partial file.
 
 **Limits of unsigned files (important).** wags files are plain, unsigned files, so anyone with write access to the workspace can defeat local checks. Known cases:
 - Truncation that happens **before the first convergence** is undetectable. There is no anchor yet.
 - **A whole stream deleted (together with its registry entry) before the first convergence** is undetectable. The reviewer simply never existed.
 - **The anchor itself can be deleted or edited.** Removing `converged.json` resets `anchor_status` to `absent`. Editing out one reviewer's stream anchor *and* that reviewer's `anchor_context.registered_reviewers` entry hides their truncation. Rolling back a stream and `converged.json` together to an earlier consistent snapshot is also undetectable.
 - **Renaming a stream** (e.g. `a.jsonl` to `c.jsonl` and re-registering) is caught only when an anchor exists. Without one it looks like a different reviewer.
+- **Downgrade cases that need `index.json` scrubbed** (Parallax cases N1, N2, N4, N5), in each case with `target.json` set to 0.1.0 and the registry emptied:
+  - **N1:** downgrade before the first anchor.
+  - **N2:** `converged.json` deleted.
+  - **N4:** `anchor_context` edited to claim legacy/0.1.0.
+  - **N5:** `anchor_context` removed.
+  Without the chained marker these would rely only on the index marker and could slip through. With the marker, all four give **BLOCK**, because the streams' own hash-chained entries declare 0.2.0. They would be undetectable only if the attacker also rewrites every stream with recomputed hashes and no markers. Any attacker able to regenerate entire chains defeats every local check. Only an external copy of the anchor (or signatures) can catch that.
+- `index.json` is a hint, not a security boundary.
 - The anchor lives in `converged.json`, in the same directory an attacker would edit. **It only means something if a copy is kept somewhere tamper-resistant**: committed to git, published, or sent to another party. Then compare the anchors in your trusted copy before acting on a verdict. Deleting or rolling back `converged.json` locally erases the local anchor.
 - The registry (`reviewers.json`) is not hash-chained. It is protected by the fail-closed rule in Step 0 and by the anchor check (removing an anchored reviewer is a regression), not by cryptography.
 

@@ -53,6 +53,22 @@
 - Spec 4.6 lists the limits of unsigned files (pre-anchor deletion, anchor deletion/edit,
   joint rollback, rename without an anchor).
 
+### Final review round (Parallax round 4)
+- **`min_quorum` validation, identical in Python API/CLI and Go API/CLI:** must be an integer >= 1.
+  Rejected: 0, negatives, floats, bools, strings. Values above the registered count give DEFER
+  with `quorum.warning`. The output records the validated integer. Go API changed to
+  `ConvergeReviewOpts(id, *int)` (nil = default). Previously Python treated -1 as "no quorum"
+  while Go treated it as unset.
+- **Hash-chained protocol marker:** new entries in non-0.1.0 reviews carry
+  `metadata.wags_protocol`. A chained marker on a 0.1.0 target is a downgrade and gives BLOCK. This closes
+  the index-scrub downgrade cases (N1, N2, N4, N5). 0.1.0 reviews stay unmarked.
+- `anchor_status: "present_no_context"` for older `converged.json` files.
+- Atomic JSON writes (temp + rename) in both implementations. Fixes a race where parallel
+  converges could read a half-written `target.json` / `converged.json`.
+- Spec: defer counts toward quorum, a silent reviewer stalls the review (remedies documented),
+  `min_quorum` is a caller-side setting that gates must check, `index.json` is a hint only, and
+  the honest downgrade limits.
+
 ### Note on unreleased intermediate builds
 - Go logs written by the round-1 build of this PR (never released) may fail `verify`. Only
   0.1.0 (released) and final 0.2.0 formats are supported.
