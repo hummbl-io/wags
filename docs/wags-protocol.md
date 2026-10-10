@@ -127,9 +127,16 @@ Each line is a JSON object with cryptographic chaining:
 - **`N` (Note / Praise)**: Positive verification or context observation.
 
 ### 4.2 Consensus Decision Rules (protocol 0.2.0)
-**Step 0: integrity and registration.** Before counting anything, convergence runs `verify`:
-- Streams whose reviewer is not in `reviewers.json` are **excluded** and listed in `unregistered_streams`. Legacy exception: if `reviewers.json` is empty (wags-go 0.1.0 never populated it), every stream counts and `registry_empty: true` is reported.
-- Registered streams that fail verification (bad hash, broken `prev_hash`, `sequence` not 1..n in file order, `reviewer` not matching the stream name, invalid resolution refs) are **excluded** and listed in `invalid_streams`. **If any registered stream is invalid, the overall verdict is `BLOCK`**: a tampered or corrupt log could be hiding a veto, so the safe result is to stop, not to approve without it.
+**Step 0: integrity, registration and anchors.** Before counting anything, convergence runs `verify` and checks the previous anchors (4.6).
+- **Registration (fail closed).** Only reviewers listed in `reviewers.json` vote.
+  - A stream that has entries (or unparseable content) but no registration **fails `verify`** and forces **`BLOCK`**. It is listed in both `unregistered_streams` and `invalid_streams`. So deleting a vetoer's key from `reviewers.json` cannot silently drop their vote.
+  - Empty unregistered stream files are ignored.
+  - A missing or empty `reviewers.json` does **not** relax this for 0.2.0 targets.
+- **Legacy registry mode** (`registry_mode: "legacy_all_streams"`) applies **only** when `target.json` says `protocol_version: "0.1.0"` **and** the registry is empty or missing. That is how wags-go 0.1.0 left workspaces. The mode is decided by the target's protocol, never by the registry's contents, so emptying `reviewers.json` on a 0.2.0 review cannot switch modes. (This replaces the earlier "empty registry counts everyone" fallback.)
+- **Integrity.** Streams that fail verification are excluded, listed in `invalid_streams`, and force **`BLOCK`**. Verification covers bad hashes, broken `prev_hash` links, `sequence` not 1..n in file order, `reviewer` not matching the stream, invalid resolution refs, unregistered entries, and disallowed legacy hashes.
+  - **Availability caveat:** because of this, anyone who can write a registered reviewer's file (or add an unregistered one) can **stall** a review with garbage. That is a deliberate fail-closed trade-off: wags prefers a stuck review to a silently wrong approval. An operator must repair or remove the stream.
+- **Regressions.** If any stream regressed since the last anchor (4.6), the verdict is **`BLOCK`** and the stream is listed in `regressed_streams`.
+- **Output.** `verify_valid` is the raw result over all stream files. `invalid_streams` names every stream that failed and why, so an invalid result is never ambiguous.
 
 Then, per valid stream, processed in `sequence` order:
 - **Latest verdict wins.** A reviewer's vote is the `verdict` of their highest-sequence entry that has one. A later entry with no verdict does not reset the vote.
@@ -172,7 +179,29 @@ Entry hashes are SHA-256 over the UTF-8 encoding of Python's `json.dumps(payload
 - numbers keep their literal form (`1.0`, `-0.0`, `1e-07`, big integers). The Go implementation decodes with `json.Number` and uses its own encoder to preserve this.
 
 ### 4.5 Legacy Go Hashes
-wags-go 0.1.0 hashed with `encoding/json.Marshal`, which escapes `<`, `>`, `&` as `\u003c`/`\u003e`/`\u0026` and U+2028/U+2029 as `\u2028`/`\u2029`. For compatibility, `verify` (in both implementations) **accepts** an entry whose stored hash matches either the canonical hash or this legacy encoding. New entries are always written with the canonical hash.
+wags-go 0.1.0 hashed with `encoding/json.Marshal`, which escapes `<`, `>`, `&` as `\u003c`/`\u003e`/`\u0026` and U+2028/U+2029 as `\u2028`/`\u2029`.
+- `verify` accepts an entry whose stored hash matches this legacy encoding **only** when `target.json` declares `protocol_version: "0.1.0"`, **and** only while no canonical-form entry has yet appeared in that stream. A legacy-form entry after a canonical-form one is rejected.
+- In 0.2.0 reviews only the canonical hash (4.4) is accepted.
+- New entries are always written in canonical form.
+- The Go encoder widens `float32` to `float64` before formatting, matching what Python would see.
+
+### 4.6 Truncation, Deletion and Anchors
+**What the hash chain cannot do.** Each entry commits to its predecessor, so editing, reordering or inserting entries is detectable. But a chain **cannot detect truncation from the tail, or deletion of a whole stream**: a prefix of a valid chain is itself a valid chain, and a missing file has nothing to check. Without an external reference, a reviewer's final `block` can be dropped and `verify` still passes.
+
+**Anchors.** Each convergence writes `anchors` into `converged.json`: for every counted stream, the latest `{sequence, entry_hash}`. On the next convergence, a stream is **regressed** if any of these hold:
+- the file is gone;
+- it has fewer entries than the anchored sequence;
+- the entry at the anchored sequence no longer has the anchored hash;
+- the reviewer was removed from `reviewers.json`.
+
+Any regression forces **`BLOCK`**, and the stream is listed in `regressed_streams` with a reason. A regressed stream keeps its old anchor, so the BLOCK persists until an operator intervenes. Streams that only grew are fine.
+
+**Limits (important):**
+- Truncation that happens **before the first convergence** is undetectable. There is no anchor yet.
+- The anchor lives in `converged.json`, in the same directory an attacker would edit. **It only means something if a copy is kept somewhere tamper-resistant**: committed to git, published, or sent to another party. Then compare the anchors in your trusted copy before acting on a verdict. Deleting or rolling back `converged.json` locally erases the local anchor.
+- The registry (`reviewers.json`) is not hash-chained. It is protected by the fail-closed rule in Step 0 and by the anchor check (removing an anchored reviewer is a regression), not by cryptography.
+
+**Resolution refs** (4.3): `resolves: []` and `supersedes: []` are rejected as no-ops, in both implementations.
 
 ---
 

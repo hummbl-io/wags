@@ -8,13 +8,32 @@
   the P0 veto and the P1 rule.
 - `converge` now runs `verify` first. Registered streams that fail verification are excluded
   and reported in `invalid_streams`, and they force `BLOCK`. Streams not in `reviewers.json` are
-  excluded and reported in `unregistered_streams` (unless the registry is empty, as in
-  wags-go 0.1.0 workspaces). Verify also checks `sequence` is 1..n and that `reviewer` matches the stream.
+  reported in `unregistered_streams` (see the round-2 notes above for fail-closed handling). Verify also checks `sequence` is 1..n and that `reviewer` matches the stream.
 - Go: entry hashing now uses a dedicated canonical encoder that matches Python byte for byte
   (no HTML escaping, raw U+2028/9, literal backslash text preserved, number literals such as
   `1.0`, `-0.0`, `1e-07` preserved via `json.Number`). Previously Go could not verify
   Python-written entries containing `<`, `>`, `&` or such numbers.
 - Go `RegisterReviewer` now records the reviewer in `reviewers.json`, as Python does.
+
+### Security / integrity (Parallax round 2)
+- **Anchors (spec 4.6):** each convergence records every counted stream's latest
+  `{sequence, entry_hash}` in `converged.json`. The next convergence BLOCKs and lists
+  `regressed_streams` if a stream was truncated, emptied or deleted, lost its anchored entry, or
+  its reviewer was removed from `reviewers.json`. The spec now says plainly that a hash chain
+  alone cannot detect tail truncation or stream deletion, and that the anchor only helps if
+  `converged.json` is kept somewhere tamper-resistant (git, published).
+- **Fail-closed registration:** a stream with entries but no `reviewers.json` registration now
+  fails `verify` and BLOCKs converge. Deleting a vetoer's key no longer drops their vote.
+- **Legacy registry mode** (count every stream) applies only to protocol 0.1.0 targets with an
+  empty or missing registry. It is no longer triggered by emptying `reviewers.json` on 0.2.0 reviews.
+- **Legacy Go hash form** is accepted only for 0.1.0 targets and never after a canonical-form
+  entry in the same stream.
+- Go encodes `float32` by widening to `float64` (matches Python).
+- `resolves: []` / `supersedes: []` are rejected.
+- `converged.json` adds `registry_mode`, `regressed_streams`, `anchors`, `verify_valid` and
+  `verify_scope`. `invalid_streams` now also covers unregistered streams with content.
+- Documented: a garbage registered stream (or unregistered stream with content) can stall a
+  review. This is the deliberate fail-closed trade-off.
 
 ### Added
 - Optional `metadata.resolves` (finding ids) and `metadata.supersedes` (entry hashes), in Python
