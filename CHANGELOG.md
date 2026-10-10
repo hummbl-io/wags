@@ -69,6 +69,18 @@
   `min_quorum` is a caller-side setting that gates must check, `index.json` is a hint only, and
   the honest downgrade limits.
 
+### Pre-merge P3 fixes (Parallax round 5)
+- Spec 4.6: documented that the chained marker only protects after the first tool-written entry
+  (M1), and that hand-written entries can leave it out. Softened the "can't downgrade" wording.
+- `min_quorum` CLI parity: an explicitly empty value (`-min-quorum ''` / `--min-quorum ''`) and
+  oversized values are rejected identically in Python and Go with the same message. Both bound
+  `min_quorum` to 1..1,000,000 (API and CLI). Previously Go treated `''` as the default and Python
+  DEFERred on 20-digit values.
+- Atomic writes now fsync the temp file and (POSIX) the directory before and after the rename.
+  Go no longer drops the `converged.json` write error: `ConvergeReview` returns it and the CLI
+  exits non-zero. The Python CLI prints the error and exits 1. On Windows the rename is retried
+  for about 1s, then fails loudly.
+
 ### Note on unreleased intermediate builds
 - Go logs written by the round-1 build of this PR (never released) may fail `verify`. Only
   0.1.0 (released) and final 0.2.0 formats are supported.

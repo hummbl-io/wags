@@ -138,7 +138,7 @@ Each line is a JSON object with cryptographic chaining:
   - **no 0.2.0 marker** exists anywhere: no entry uses `resolves`/`supersedes`, `index.json` (workspace or per-review entry) doesn't declare 0.2.0, `converged.json` doesn't record a 0.2.0 `anchor_context` or `registry_mode: "registered"`, and `converged.json` isn't unparseable.
   - Once registered mode has been recorded, a review **never** falls back to legacy.
   - **Hash-chained marker:** every new entry in a review whose target is not 0.1.0 carries `metadata.wags_protocol: "0.2.0"`, which `entry_hash` covers. Entries in 0.1.0 reviews stay unmarked, so old reviews can continue. Any chained marker counts as a 0.2.0 marker. On a 0.1.0 target it is reported as a protocol downgrade and gives **BLOCK**.
-  - Editing `target.json` to 0.1.0 and emptying the registry therefore can't downgrade a 0.2.0 review, **as long as the streams themselves aren't rewritten**. Scrubbing `index.json` or editing `converged.json` isn't enough, because the markers sit inside the hash-chained entries. Removing them means recomputing every entry hash, which is the general "unsigned files can be regenerated" limit in 4.6.
+  - Once a 0.2.0 review has **at least one tool-written entry**, editing `target.json` to 0.1.0, emptying the registry and scrubbing `index.json` or `converged.json` is detected and gives BLOCK, because the marker sits inside a hash-chained entry. This is protection against casual tampering, not a guarantee. See the limits in 4.6 (M1, hand-written entries, full chain regeneration).
 - **Integrity.** Streams that fail verification are excluded, listed in `invalid_streams`, and force **`BLOCK`**. Verification covers bad hashes, broken `prev_hash` links, `sequence` not 1..n in file order, `reviewer` not matching the stream, invalid resolution refs, unregistered entries, and disallowed legacy hashes.
   - **Availability caveat:** because of this, anyone who can write a registered reviewer's file (or add an unregistered one) can **stall** a review with garbage. That is a deliberate fail-closed trade-off: wags prefers a stuck review to a silently wrong approval. An operator must repair or remove the stream.
 - **Regressions and anchor problems.** If any stream regressed since the last anchor (4.6), or there is any anchor/protocol problem (4.6), the verdict is **`BLOCK`**. Streams are listed in `regressed_streams`, and other problems in `anchor_problems`; both are also stated in `rationale`. So a gate that reads only `overall_verdict` still stops.
@@ -219,7 +219,14 @@ Any regression forces **`BLOCK`**, and the stream is listed in `regressed_stream
 - The old context is kept while a problem persists.
 - `anchor_status` is `absent` (first converge), `present`, `present_no_context` (an older `converged.json` without `anchor_context`, e.g. written by an earlier build; stream anchors are still checked), or `unparseable`. **Unparseable fails closed**: it gives BLOCK and sets `anchor_lost: true`, which is carried forward, so every later converge blocks until an operator reviews it. (Deleting `converged.json` clears this; see the limits.)
 
-**Concurrency.** `converged.json`, `target.json`, `index.json` and `reviewers.json` are written atomically (temp file + rename), so a concurrent reader never sees a partial file.
+**Durability and concurrency.** `converged.json`, `target.json`, `index.json` and `reviewers.json` are written atomically, so a concurrent reader never sees a partial file:
+- the data goes to a temp file in the same directory, which is **fsynced**;
+- the temp file is renamed over the target;
+- the directory is then fsynced (POSIX; skipped where unsupported, e.g. Windows).
+
+A failed write is **never silent**. Python raises `OSError`, and the CLI prints an error and exits 1. Go `ConvergeReview` returns an error, and the CLI exits non-zero.
+
+**Windows:** replacing a file that another process holds open fails with an access error. Both implementations retry the rename for about 1 second (20 × 50 ms), then fail with the error and remove the temp file. Close readers or retry the converge.
 
 **Limits of unsigned files (important).** wags files are plain, unsigned files, so anyone with write access to the workspace can defeat local checks. Known cases:
 - Truncation that happens **before the first convergence** is undetectable. There is no anchor yet.
@@ -232,6 +239,8 @@ Any regression forces **`BLOCK`**, and the stream is listed in `regressed_stream
   - **N4:** `anchor_context` edited to claim legacy/0.1.0.
   - **N5:** `anchor_context` removed.
   Without the chained marker these would rely only on the index marker and could slip through. With the marker, all four give **BLOCK**, because the streams' own hash-chained entries declare 0.2.0. They would be undetectable only if the attacker also rewrites every stream with recomputed hashes and no markers. Any attacker able to regenerate entire chains defeats every local check. Only an external copy of the anchor (or signatures) can catch that.
+- **M1, no tool-written entries yet:** if a 0.2.0 review has registered reviewers but **zero entries**, there's no chained marker to find. An attacker who downgrades `target.json`, empties the registry, scrubs `index.json` and adds one unmarked approval gets **APPROVE in legacy mode** (both implementations). The marker only protects a review after its first tool-written entry.
+- **Hand-written entries:** the marker is added by the reference tools. A hand-written (or third-party-tool) entry can simply leave it out and still be a valid chain link, so unmarked streams provide no downgrade evidence.
 - `index.json` is a hint, not a security boundary.
 - The anchor lives in `converged.json`, in the same directory an attacker would edit. **It only means something if a copy is kept somewhere tamper-resistant**: committed to git, published, or sent to another party. Then compare the anchors in your trusted copy before acting on a verdict. Deleting or rolling back `converged.json` locally erases the local anchor.
 - The registry (`reviewers.json`) is not hash-chained. It is protected by the fail-closed rule in Step 0 and by the anchor check (removing an anchored reviewer is a regression), not by cryptography.
