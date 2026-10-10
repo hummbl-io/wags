@@ -105,10 +105,18 @@ class StreamEntry:
         else:
             self.signature = ""
 
-    def verify_entry(self, secret_key: Optional[str] = None) -> Tuple[bool, str]:
+    def hash_form(self) -> str:
+        """'canonical', 'legacy' (wags-go 0.1.0 encoding) or 'none'."""
+        if self.entry_hash == self.compute_hash():
+            return "canonical"
+        if self.entry_hash == self.compute_legacy_go_hash():
+            return "legacy"
+        return "none"
+
+    def verify_entry(self, secret_key: Optional[str] = None, allow_legacy: bool = False) -> Tuple[bool, str]:
         expected_hash = self.compute_hash()
-        if self.entry_hash != expected_hash and self.compute_legacy_go_hash() == self.entry_hash:
-            expected_hash = self.entry_hash  # accepted: wags-go 0.1.0 legacy encoding
+        if allow_legacy and self.entry_hash != expected_hash and self.compute_legacy_go_hash() == self.entry_hash:
+            expected_hash = self.entry_hash  # accepted: wags-go 0.1.0 legacy encoding (0.1.0 targets only)
         if self.entry_hash != expected_hash:
             return False, f"Hash mismatch: stored {self.entry_hash} != computed {expected_hash}"
         if secret_key and self.signature:
@@ -308,7 +316,7 @@ class WagsWorkspace:
         if "resolves" in md or "supersedes" in md:
             stream_path = rev_dir / f"{reviewer_name}.jsonl"
             prior = self._read_stream_dicts(stream_path) if stream_path.exists() else []
-            errs = self._check_resolution_refs(prior, md.get("resolves", []), md.get("supersedes", []))
+            errs = self._check_resolution_refs(prior, md.get("resolves", []), md.get("supersedes", []), md)
             if errs:
                 raise ValueError("; ".join(errs))
 
@@ -380,6 +388,11 @@ class WagsWorkspace:
 
         keys = keys or {}
         results: Dict[str, Any] = {"review_id": review_id, "streams": {}, "valid": True}
+        target_proto = self._target_protocol(rev_dir)
+        legacy_target = target_proto == "0.1.0"
+        registered = self._registered(rev_dir)
+        legacy_all = legacy_target and not registered
+        results["registry_mode"] = "legacy_all_streams" if legacy_all else "registered"
 
         for path in rev_dir.glob("*.jsonl"):
             reviewer = path.stem
@@ -387,6 +400,7 @@ class WagsWorkspace:
             errors = []
             expected_prev = GENESIS_HASH
             prior_dicts: List[Dict[str, Any]] = []
+            seen_canonical = False
 
             with open(path, "r", encoding="utf-8") as f:
                 for idx, line in enumerate(f, start=1):
@@ -419,7 +433,11 @@ class WagsWorkspace:
 
                         # Check cryptographic integrity
                         secret_key = keys.get(reviewer)
-                        ok, msg = entry.verify_entry(secret_key)
+                        ok, msg = entry.verify_entry(secret_key, allow_legacy=legacy_target and not seen_canonical)
+                        if ok and entry.entry_hash == entry.compute_hash():
+                            seen_canonical = True
+                        elif not ok and legacy_target and seen_canonical and entry.hash_form() == "legacy":
+                            msg = "legacy-form hash after a canonical-form entry is not allowed"
                         if not ok:
                             stream_valid = False
                             errors.append(f"Line {idx} sequence {entry.sequence}: {msg}")
@@ -432,7 +450,8 @@ class WagsWorkspace:
                             errors.append(f"Line {idx}: reviewer '{entry.reviewer}' does not match stream '{reviewer}'")
                         # Validate resolution refs (own stream, earlier entries only)
                         res, sup = self._resolution_refs(d)
-                        for msg2 in self._check_resolution_refs(prior_dicts, res, sup):
+                        md_d = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+                        for msg2 in self._check_resolution_refs(prior_dicts, res, sup, md_d):
                             stream_valid = False
                             errors.append(f"Line {idx} sequence {entry.sequence}: {msg2}")
                         prior_dicts.append(d)
@@ -442,6 +461,9 @@ class WagsWorkspace:
                         stream_valid = False
                         errors.append(f"Line {idx} parse error: {ex}")
 
+            if prior_dicts and not legacy_all and reviewer not in registered:
+                stream_valid = False
+                errors.append("stream has entries but reviewer is not registered in reviewers.json")
             results["streams"][reviewer] = {
                 "valid": stream_valid,
                 "errors": errors,
@@ -454,6 +476,23 @@ class WagsWorkspace:
     # ------------------------------------------------------------------
     # Finding resolution (protocol 0.2.0)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _target_protocol(rev_dir: Path) -> str:
+        try:
+            with open(rev_dir / "target.json", "r", encoding="utf-8") as f:
+                return str(json.load(f).get("protocol_version", ""))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _registered(rev_dir: Path) -> set:
+        try:
+            with open(rev_dir / "reviewers.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data.keys()) if isinstance(data, dict) else set()
+        except Exception:
+            return set()
+
     @staticmethod
     def _read_stream_dicts(path: Path) -> List[Dict[str, Any]]:
         """Read a reviewer stream in file (append) order."""
@@ -478,7 +517,7 @@ class WagsWorkspace:
 
     @staticmethod
     def _check_resolution_refs(
-        prior: List[Dict[str, Any]], resolves: Any, supersedes: Any
+        prior: List[Dict[str, Any]], resolves: Any, supersedes: Any, present: Optional[Any] = None
     ) -> List[str]:
         """Validate resolves/supersedes against the reviewer's OWN earlier entries."""
         errors: List[str] = []
@@ -486,12 +525,16 @@ class WagsWorkspace:
         prior_hashes = {e.get("entry_hash") for e in prior}
         if not isinstance(resolves, list) or not all(isinstance(x, str) for x in resolves):
             errors.append("metadata.resolves must be a list of finding id strings")
+        elif present is not None and "resolves" in present and not resolves:
+            errors.append("metadata.resolves must not be empty")
         else:
             for fid in resolves:
                 if fid not in prior_ids:
                     errors.append(f"metadata.resolves references unknown finding '{fid}' (not in this reviewer's earlier entries)")
         if not isinstance(supersedes, list) or not all(isinstance(x, str) for x in supersedes):
             errors.append("metadata.supersedes must be a list of entry_hash strings")
+        elif present is not None and "supersedes" in present and not supersedes:
+            errors.append("metadata.supersedes must not be empty")
         else:
             for h in supersedes:
                 if h not in prior_hashes:
@@ -514,7 +557,8 @@ class WagsWorkspace:
         instances: List[Dict[str, Any]] = []  # {"pos", "hash", "finding", "resolved"}
         for idx, d in enumerate(entries):
             resolves, supersedes = cls._resolution_refs(d)
-            if not cls._check_resolution_refs(entries[:idx], resolves, supersedes):
+            md_d = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+            if not cls._check_resolution_refs(entries[:idx], resolves, supersedes, md_d):
                 res_ids, sup = set(resolves), set(supersedes)
                 for inst in instances:  # all instances are from earlier entries
                     if inst["finding"].get("id") in res_ids or inst["hash"] in sup:
@@ -546,16 +590,41 @@ class WagsWorkspace:
             target_data = json.load(f)
 
         verification = self.verify_review(review_id, keys)
-        registered: set = set()
-        reg_file = rev_dir / "reviewers.json"
-        if reg_file.exists():
-            with open(reg_file, "r", encoding="utf-8") as f:
-                registered = set(json.load(f).keys())
-        # Legacy: wags-go 0.1.0 never wrote reviewers.json entries. With an empty
-        # registry every stream is treated as registered (reported via registry_empty).
-        registry_empty = not registered
+        registered = self._registered(rev_dir)
+        # Legacy "count every stream" mode ONLY for protocol 0.1.0 targets with an
+        # empty/missing registry (wags-go 0.1.0 never populated it). For 0.2.0
+        # targets an unregistered stream with entries fails verify -> BLOCK.
+        legacy_all = verification.get("registry_mode") == "legacy_all_streams"
+        registry_mode = "legacy_all_streams" if legacy_all else "registered"
         invalid_streams: List[Dict[str, Any]] = []
         unregistered_streams: List[str] = []
+
+        # Anchors from the previous convergence (truncation / deletion detection).
+        prev_anchors: Dict[str, Any] = {}
+        conv_file = rev_dir / "converged.json"
+        if conv_file.exists():
+            try:
+                with open(conv_file, "r", encoding="utf-8") as f:
+                    prev_anchors = json.load(f).get("anchors", {}) or {}
+            except Exception:
+                prev_anchors = {}
+        regressed_streams: List[Dict[str, Any]] = []
+        for anchored, a in sorted(prev_anchors.items()):
+            ap = rev_dir / f"{anchored}.jsonl"
+            cur = self._read_stream_dicts(ap) if ap.exists() else []
+            seq, h = a.get("sequence", 0), a.get("entry_hash", "")
+            by_seq = {e.get("sequence"): e.get("entry_hash") for e in cur}
+            if not ap.exists():
+                reason = "stream deleted"
+            elif len(cur) < seq:
+                reason = f"stream shorter than anchor ({len(cur)} < {seq})"
+            elif by_seq.get(seq) != h:
+                reason = f"anchored entry_hash missing at sequence {seq}"
+            elif not legacy_all and anchored not in registered:
+                reason = "reviewer removed from reviewers.json"
+            else:
+                continue
+            regressed_streams.append({"reviewer": anchored, "anchor": {"sequence": seq, "entry_hash": h}, "reason": reason})
 
         reviewer_latest_verdicts: Dict[str, str] = {}
         all_findings: List[Dict[str, Any]] = []
@@ -568,10 +637,12 @@ class WagsWorkspace:
 
         for path in sorted(rev_dir.glob("*.jsonl")):
             reviewer = path.stem
-            if not registry_empty and reviewer not in registered:
-                unregistered_streams.append(reviewer)
-                continue
             sv = verification["streams"].get(reviewer, {})
+            if not legacy_all and reviewer not in registered:
+                unregistered_streams.append(reviewer)
+                if not sv.get("valid", False):  # has entries (or garbage): fail closed
+                    invalid_streams.append({"reviewer": reviewer, "errors": sv.get("errors", [])})
+                continue
             if not sv.get("valid", False):
                 invalid_streams.append({"reviewer": reviewer, "errors": sv.get("errors", [])})
                 continue
@@ -605,9 +676,13 @@ class WagsWorkspace:
         open_p0 = severity_counts.get("P0", 0)  # includes unknown severities (treated as P0)
         blocking_p1 = len(blocking_findings) - open_p0
 
-        if invalid_streams:
+        if regressed_streams:
             overall_verdict = "BLOCK"
-            rationale = (f"Integrity failure: {len(invalid_streams)} registered stream(s) failed verification "
+            rationale = (f"Regression: {len(regressed_streams)} stream(s) lost entries or registration since the last "
+                         f"convergence anchor ({', '.join(x['reviewer'] for x in regressed_streams)}).")
+        elif invalid_streams:
+            overall_verdict = "BLOCK"
+            rationale = (f"Integrity failure: {len(invalid_streams)} stream(s) failed verification "
                          f"({', '.join(x['reviewer'] for x in invalid_streams)}); excluded and review blocked.")
         elif open_p0 > 0 or verdict_counts.get("block", 0) > 0:
             overall_verdict = "BLOCK"
@@ -621,6 +696,20 @@ class WagsWorkspace:
         else:
             overall_verdict = "DEFER"
             rationale = "Insufficient quorum or inconclusive vote."
+
+        # New anchors: each stream's latest (sequence, entry_hash). A regressed
+        # stream keeps its OLD anchor so the BLOCK persists until an operator
+        # intervenes. Anchors only help if converged.json is kept somewhere
+        # tamper-resistant (committed to git or published) -- see spec 4.6.
+        regressed_names = {x["reviewer"] for x in regressed_streams}
+        anchors: Dict[str, Any] = {n: a for n, a in prev_anchors.items() if n in regressed_names}
+        for path in sorted(rev_dir.glob("*.jsonl")):
+            name = path.stem
+            if name in regressed_names or (not legacy_all and name not in registered):
+                continue
+            ents = sorted(self._read_stream_dicts(path), key=lambda e: e.get("sequence", 0))
+            if ents:
+                anchors[name] = {"sequence": ents[-1].get("sequence"), "entry_hash": ents[-1].get("entry_hash")}
 
         converged_manifest = {
             "protocol_version": PROTOCOL_VERSION,
@@ -638,7 +727,12 @@ class WagsWorkspace:
             },
             "invalid_streams": invalid_streams,
             "unregistered_streams": unregistered_streams,
-            "registry_empty": registry_empty,
+            "registry_empty": not registered,
+            "registry_mode": registry_mode,
+            "regressed_streams": regressed_streams,
+            "verify_valid": bool(verification.get("valid")),
+            "verify_scope": "all stream files; invalid_streams lists the ones that failed (registered or unregistered-with-entries)",
+            "anchors": anchors,
             "unknown_severity_findings": unknown_severity_findings,
             "blocking_findings": blocking_findings,
             "open_findings": open_findings,

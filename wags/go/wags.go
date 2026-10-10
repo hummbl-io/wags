@@ -145,6 +145,8 @@ func writeCanonical(buf *bytes.Buffer, v interface{}) error {
 		buf.WriteString(strconv.Itoa(x))
 	case int64:
 		buf.WriteString(strconv.FormatInt(x, 10))
+	case float32:
+		buf.WriteString(pyFloat(float64(x))) // Python sees the widened float64 value
 	case float64:
 		buf.WriteString(pyFloat(x))
 	case []interface{}:
@@ -278,11 +280,28 @@ func signEntry(entry *StreamEntry, secretKey string) error {
 }
 
 func verifyEntry(entry *StreamEntry, secretKey string) (bool, string) {
+	return verifyEntryOpt(entry, secretKey, false)
+}
+
+// hashForm reports "canonical", "legacy" (wags-go 0.1.0) or "none".
+func hashForm(entry *StreamEntry) string {
+	if h, err := computeEntryHash(entry); err == nil && h == entry.EntryHash {
+		return "canonical"
+	}
+	if h, err := computeSHA256OfPayload(entryPayload(entry), true); err == nil && h == entry.EntryHash {
+		return "legacy"
+	}
+	return "none"
+}
+
+// verifyEntryOpt accepts the legacy wags-go 0.1.0 hash only when allowLegacy
+// (protocol 0.1.0 targets, before any canonical-form entry in the stream).
+func verifyEntryOpt(entry *StreamEntry, secretKey string, allowLegacy bool) (bool, string) {
 	expectedHash, err := computeEntryHash(entry)
 	if err != nil {
 		return false, fmt.Sprintf("Hash calculation error: %v", err)
 	}
-	if entry.EntryHash != expectedHash {
+	if allowLegacy && entry.EntryHash != expectedHash {
 		if legacy, lerr := computeSHA256OfPayload(entryPayload(entry), true); lerr == nil && legacy == entry.EntryHash {
 			expectedHash = legacy // accepted: wags-go 0.1.0 legacy encoding
 		}
@@ -551,6 +570,31 @@ func (ws *WagsWorkspace) TailReview(reviewID string) ([]StreamEntry, error) {
 	return all, nil
 }
 
+func targetProtocol(revDir string) string {
+	var t map[string]interface{}
+	if b, err := os.ReadFile(filepath.Join(revDir, "target.json")); err == nil {
+		_ = json.Unmarshal(b, &t)
+	}
+	if v, ok := t["protocol_version"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func registeredReviewers(revDir string) map[string]interface{} {
+	reg := map[string]interface{}{}
+	if b, err := os.ReadFile(filepath.Join(revDir, "reviewers.json")); err == nil {
+		_ = json.Unmarshal(b, &reg)
+	}
+	return reg
+}
+
+// legacyAllStreams: count every stream only for protocol 0.1.0 targets with an
+// empty/missing registry (wags-go 0.1.0 never populated reviewers.json).
+func legacyAllStreams(revDir string) bool {
+	return targetProtocol(revDir) == "0.1.0" && len(registeredReviewers(revDir)) == 0
+}
+
 func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (bool, []string, error) {
 	revDir := filepath.Join(ws.ReviewsDir, reviewID)
 	if _, err := os.Stat(revDir); os.IsNotExist(err) {
@@ -566,6 +610,9 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 
 	valid := true
 	var errorsList []string
+	legacyTarget := targetProtocol(revDir) == "0.1.0"
+	registered := registeredReviewers(revDir)
+	legacyAll := legacyTarget && len(registered) == 0
 
 	for _, match := range matches {
 		reviewer := strings.TrimSuffix(filepath.Base(match), ".jsonl")
@@ -576,6 +623,7 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 		expectedPrev := GenesisHash
 		var prior []StreamEntry
+		seenCanonical := false
 
 		for idx, line := range lines {
 			if strings.TrimSpace(line) == "" {
@@ -595,7 +643,12 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 			if keys != nil {
 				secret = keys[reviewer]
 			}
-			ok, msg := verifyEntry(&entry, secret)
+			ok, msg := verifyEntryOpt(&entry, secret, legacyTarget && !seenCanonical)
+			if ok && hashForm(&entry) == "canonical" {
+				seenCanonical = true
+			} else if !ok && legacyTarget && seenCanonical && hashForm(&entry) == "legacy" {
+				msg = "legacy-form hash after a canonical-form entry is not allowed"
+			}
 			if !ok {
 				valid = false
 				errorsList = append(errorsList, fmt.Sprintf("%s line %d: %s", reviewer, idx+1, msg))
@@ -614,6 +667,10 @@ func (ws *WagsWorkspace) VerifyReview(reviewID string, keys map[string]string) (
 			}
 			prior = append(prior, entry)
 			expectedPrev = entry.EntryHash
+		}
+		if _, ok := registered[reviewer]; len(prior) > 0 && !legacyAll && !ok {
+			valid = false
+			errorsList = append(errorsList, fmt.Sprintf("%s line 0: stream has entries but reviewer is not registered in reviewers.json", reviewer))
 		}
 	}
 	return valid, errorsList, nil
@@ -682,6 +739,8 @@ func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []strin
 		errs = append(errs, "metadata.resolves must be a list of finding id strings")
 	} else if res, ok := stringList(md["resolves"]); !ok {
 		errs = append(errs, "metadata.resolves must be a list of finding id strings")
+	} else if _, present := md["resolves"]; present && len(res) == 0 {
+		errs = append(errs, "metadata.resolves must not be empty")
 	} else {
 		for _, id := range res {
 			if !ids[id] {
@@ -693,6 +752,8 @@ func checkResolutionRefs(prior []StreamEntry, md map[string]interface{}) []strin
 		errs = append(errs, "metadata.supersedes must be a list of entry_hash strings")
 	} else if sup, ok := stringList(md["supersedes"]); !ok {
 		errs = append(errs, "metadata.supersedes must be a list of entry_hash strings")
+	} else if _, present := md["supersedes"]; present && len(sup) == 0 {
+		errs = append(errs, "metadata.supersedes must not be empty")
 	} else {
 		for _, h := range sup {
 			if !hashes[h] {
@@ -778,10 +839,66 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	}
 	sort.Strings(matches)
 
-	_, verrs, _ := ws.VerifyReview(reviewID, nil)
-	registered := map[string]interface{}{}
-	if b, err := os.ReadFile(filepath.Join(revDir, "reviewers.json")); err == nil {
-		_ = json.Unmarshal(b, &registered)
+	verifyOK, verrs, _ := ws.VerifyReview(reviewID, nil)
+	registered := registeredReviewers(revDir)
+	legacyAll := legacyAllStreams(revDir)
+	registryMode := "registered"
+	if legacyAll {
+		registryMode = "legacy_all_streams"
+	}
+
+	// Anchors from the previous convergence (truncation / deletion detection).
+	prevAnchors := map[string]map[string]interface{}{}
+	if b, err := os.ReadFile(filepath.Join(revDir, "converged.json")); err == nil {
+		var prev struct {
+			Anchors map[string]map[string]interface{} `json:"anchors"`
+		}
+		dec := json.NewDecoder(strings.NewReader(string(b)))
+		dec.UseNumber()
+		if dec.Decode(&prev) == nil && prev.Anchors != nil {
+			prevAnchors = prev.Anchors
+		}
+	}
+	regressedStreams := []map[string]interface{}{}
+	regressedNames := map[string]bool{}
+	anchorNames := make([]string, 0, len(prevAnchors))
+	for n := range prevAnchors {
+		anchorNames = append(anchorNames, n)
+	}
+	sort.Strings(anchorNames)
+	for _, name := range anchorNames {
+		a := prevAnchors[name]
+		seq := 0
+		if n, ok := a["sequence"].(json.Number); ok {
+			if v, err := n.Int64(); err == nil {
+				seq = int(v)
+			}
+		}
+		h, _ := a["entry_hash"].(string)
+		ap := filepath.Join(revDir, name+".jsonl")
+		reason := ""
+		if _, err := os.Stat(ap); err != nil {
+			reason = "stream deleted"
+		} else {
+			cur, _ := readStream(ap)
+			bySeq := map[int]string{}
+			for _, e := range cur {
+				bySeq[e.Sequence] = e.EntryHash
+			}
+			_, isReg := registered[name]
+			if len(cur) < seq {
+				reason = fmt.Sprintf("stream shorter than anchor (%d < %d)", len(cur), seq)
+			} else if bySeq[seq] != h {
+				reason = fmt.Sprintf("anchored entry_hash missing at sequence %d", seq)
+			} else if !legacyAll && !isReg {
+				reason = "reviewer removed from reviewers.json"
+			}
+		}
+		if reason != "" {
+			regressedNames[name] = true
+			regressedStreams = append(regressedStreams, map[string]interface{}{
+				"reviewer": name, "anchor": map[string]interface{}{"sequence": seq, "entry_hash": h}, "reason": reason})
+		}
 	}
 	invalidStreams := []map[string]interface{}{}
 	unregisteredStreams := []string{}
@@ -797,15 +914,18 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 
 	for _, m := range matches {
 		reviewer := strings.TrimSuffix(filepath.Base(m), ".jsonl")
-		if _, ok := registered[reviewer]; !ok && len(registered) > 0 {
-			unregisteredStreams = append(unregisteredStreams, reviewer)
-			continue
-		}
 		var serrs []string
 		for _, e := range verrs {
 			if strings.HasPrefix(e, reviewer+" line ") {
 				serrs = append(serrs, e)
 			}
+		}
+		if _, ok := registered[reviewer]; !ok && !legacyAll {
+			unregisteredStreams = append(unregisteredStreams, reviewer)
+			if len(serrs) > 0 { // has entries (or garbage): fail closed
+				invalidStreams = append(invalidStreams, map[string]interface{}{"reviewer": reviewer, "errors": serrs})
+			}
+			continue
 		}
 		if len(serrs) > 0 {
 			invalidStreams = append(invalidStreams, map[string]interface{}{"reviewer": reviewer, "errors": serrs})
@@ -852,13 +972,20 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	overallVerdict := "DEFER"
 	rationale := "Insufficient quorum or inconclusive vote."
 
-	if len(invalidStreams) > 0 {
+	if len(regressedStreams) > 0 {
+		names := []string{}
+		for _, x := range regressedStreams {
+			names = append(names, x["reviewer"].(string))
+		}
+		overallVerdict = "BLOCK"
+		rationale = fmt.Sprintf("Regression: %d stream(s) lost entries or registration since the last convergence anchor (%s).", len(regressedStreams), strings.Join(names, ", "))
+	} else if len(invalidStreams) > 0 {
 		names := []string{}
 		for _, x := range invalidStreams {
 			names = append(names, x["reviewer"].(string))
 		}
 		overallVerdict = "BLOCK"
-		rationale = fmt.Sprintf("Integrity failure: %d registered stream(s) failed verification (%s); excluded and review blocked.", len(invalidStreams), strings.Join(names, ", "))
+		rationale = fmt.Sprintf("Integrity failure: %d stream(s) failed verification (%s); excluded and review blocked.", len(invalidStreams), strings.Join(names, ", "))
 	} else if openP0 > 0 || verdictCounts["block"] > 0 {
 		overallVerdict = "BLOCK"
 		rationale = fmt.Sprintf("Blocked by %d open P0 finding(s) or explicit block vote.", openP0)
@@ -868,6 +995,24 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 	} else if totalReviewers > 0 && float64(verdictCounts["approve"]) >= (float64(totalReviewers)/2.0) {
 		overallVerdict = "APPROVE"
 		rationale = fmt.Sprintf("Approved by majority (%d/%d) with 0 blockers.", verdictCounts["approve"], totalReviewers)
+	}
+
+	// New anchors; regressed streams keep their old anchor so the BLOCK persists.
+	anchors := map[string]interface{}{}
+	for n := range regressedNames {
+		anchors[n] = prevAnchors[n]
+	}
+	for _, m := range matches {
+		name := strings.TrimSuffix(filepath.Base(m), ".jsonl")
+		if _, ok := registered[name]; regressedNames[name] || (!legacyAll && !ok) {
+			continue
+		}
+		ents, _ := readStream(m)
+		sort.SliceStable(ents, func(i, j int) bool { return ents[i].Sequence < ents[j].Sequence })
+		if len(ents) > 0 {
+			last := ents[len(ents)-1]
+			anchors[name] = map[string]interface{}{"sequence": last.Sequence, "entry_hash": last.EntryHash}
+		}
 	}
 
 	converged := map[string]interface{}{
@@ -887,6 +1032,11 @@ func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}
 		"invalid_streams":           invalidStreams,
 		"unregistered_streams":      unregisteredStreams,
 		"registry_empty":            len(registered) == 0,
+		"registry_mode":             registryMode,
+		"regressed_streams":         regressedStreams,
+		"verify_valid":              verifyOK,
+		"verify_scope":              "all stream files; invalid_streams lists the ones that failed (registered or unregistered-with-entries)",
+		"anchors":                   anchors,
 		"unknown_severity_findings": unknownSev,
 		"blocking_findings":         blockingFindings,
 		"open_findings":             openFindings,

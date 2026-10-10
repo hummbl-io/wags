@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -190,7 +191,7 @@ func TestGoReorderedStreamBlocksAndUnregisteredExcluded(t *testing.T) {
 	if u := c["unregistered_streams"].([]string); len(u) != 1 || u[0] != "zz" {
 		t.Fatalf("unregistered not reported: %v", u)
 	}
-	if inv := c["invalid_streams"].([]map[string]interface{}); len(inv) != 1 {
+	if inv := c["invalid_streams"].([]map[string]interface{}); len(inv) != 2 { // rev-a (reordered) + zz (unregistered with content, fail closed)
 		t.Fatalf("invalid not reported: %v", inv)
 	}
 }
@@ -229,5 +230,124 @@ func TestGoAcceptsLegacyGoHash(t *testing.T) {
 	}
 	if ok, errs, _ := ws.VerifyReview("rev-legacy-go-010", nil); !ok {
 		t.Fatalf("legacy entry should verify: %v", errs)
+	}
+}
+
+func writeJSON(t *testing.T, p string, v interface{}) {
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(p, b, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoAnchorDetectsTruncationAndDeletion(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P0")}, "block", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatal("baseline should block")
+	}
+	p := filepath.Join(ws.ReviewsDir, rid, "rev-a.jsonl")
+	b, _ := os.ReadFile(p)
+	_ = os.WriteFile(p, []byte(strings.Split(string(b), "\n")[0]+"\n"), 0644)
+	if ok, _, _ := ws.VerifyReview(rid, nil); !ok {
+		t.Fatal("truncated chain still verifies (expected; anchor must catch it)")
+	}
+	c, _ := ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "BLOCK" || len(c["regressed_streams"].([]map[string]interface{})) != 1 {
+		t.Fatalf("truncation must BLOCK via anchor: %v", c["rationale"])
+	}
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatal("regression BLOCK must persist")
+	}
+	_ = os.Remove(p)
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatal("deleted stream must BLOCK")
+	}
+}
+
+func TestGoDeregisteredVetoerBlocks(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P0")}, "block", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	rp := filepath.Join(ws.ReviewsDir, rid, "reviewers.json")
+	reg := registeredReviewers(filepath.Join(ws.ReviewsDir, rid))
+	delete(reg, "rev-a")
+	writeJSON(t, rp, reg)
+	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
+		t.Fatal("unregistered stream with entries must fail verify")
+	}
+	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "BLOCK" {
+		t.Fatalf("got %v", c["overall_verdict"])
+	}
+}
+
+func TestGoWipedRegistryNoLegacyOn020(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "defer", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "defer", "")
+	writeJSON(t, filepath.Join(ws.ReviewsDir, rid, "reviewers.json"), map[string]interface{}{})
+	_, _ = ws.SubmitEntry(rid, "e1", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "e2", "review", nil, "approve", "")
+	c, _ := ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "BLOCK" || c["registry_mode"] != "registered" {
+		t.Fatalf("got %v / %v", c["overall_verdict"], c["registry_mode"])
+	}
+}
+
+func TestGoLegacyHashOnlyFor010AndNotAfterCanonical(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	revDir := filepath.Join(ws.ReviewsDir, rid)
+	e, _ := ws.SubmitEntry(rid, "rev-a", "review", []Finding{{ID: "x", Severity: "P2", Finding: "<b> & c"}}, "approve", "")
+	// restamp with legacy hash
+	legacy, _ := computeSHA256OfPayload(entryPayload(e), true)
+	e.EntryHash = legacy
+	b, _ := json.Marshal(e)
+	_ = os.WriteFile(filepath.Join(revDir, "rev-a.jsonl"), append(b, '\n'), 0644)
+	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
+		t.Fatal("legacy hash must be rejected on a 0.2.0 target")
+	}
+	// 0.1.0 target: legacy alone ok
+	var tg map[string]interface{}
+	tb, _ := os.ReadFile(filepath.Join(revDir, "target.json"))
+	_ = json.Unmarshal(tb, &tg)
+	tg["protocol_version"] = "0.1.0"
+	writeJSON(t, filepath.Join(revDir, "target.json"), tg)
+	if ok, errs, _ := ws.VerifyReview(rid, nil); !ok {
+		t.Fatalf("legacy hash should verify on 0.1.0 target: %v", errs)
+	}
+	// canonical then legacy: rejected
+	_ = os.WriteFile(filepath.Join(revDir, "rev-a.jsonl"), nil, 0644)
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	e2, _ := ws.SubmitEntry(rid, "rev-a", "review", []Finding{{ID: "y", Severity: "P2", Finding: "<&>"}}, "approve", "")
+	data, _ := os.ReadFile(filepath.Join(revDir, "rev-a.jsonl"))
+	first := strings.Split(string(data), "\n")[0]
+	l2, _ := computeSHA256OfPayload(entryPayload(e2), true)
+	e2.EntryHash = l2
+	b2, _ := json.Marshal(e2)
+	_ = os.WriteFile(filepath.Join(revDir, "rev-a.jsonl"), []byte(first+"\n"+string(b2)+"\n"), 0644)
+	ok, errs, _ := ws.VerifyReview(rid, nil)
+	if ok || !strings.Contains(strings.Join(errs, " "), "legacy-form") {
+		t.Fatalf("legacy after canonical must fail: %v", errs)
+	}
+}
+
+func TestGoFloat32AndEmptyRefs(t *testing.T) {
+	b, _ := canonicalJSON(map[string]interface{}{"f": float32(0.1)})
+	if string(b) != `{"f":0.10000000149011612}` {
+		t.Fatalf("float32: %s", b)
+	}
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{f("X", "P1")}, "request_changes", "")
+	for _, md := range []map[string]interface{}{{"resolves": []interface{}{}}, {"supersedes": []interface{}{}}} {
+		if _, err := ws.SubmitEntryWithMetadata(rid, "rev-a", "review", nil, "approve", "", md); err == nil {
+			t.Fatalf("empty refs should be rejected: %v", md)
+		}
 	}
 }

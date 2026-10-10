@@ -213,13 +213,19 @@ class TestReviewRound2(unittest.TestCase):
         self.assertEqual([x["reviewer"] for x in c["invalid_streams"]], ["a"])
         self.assertIn("BLOCK", self._go("converge").stdout)
 
-    def test_unregistered_stream_excluded(self):
+    def test_unregistered_stream_fails_closed(self):
+        """0.2.0: an unregistered stream with content never votes and BLOCKs (round 2)."""
         self.ws.submit_entry(self.rid, "b", verdict="request_changes")
         (self.stream / "zz.jsonl").write_text('{"verdict":"approve","findings":[]}\n')
         c = self.ws.converge_review(self.rid)
         self.assertEqual(c["unregistered_streams"], ["zz"])
         self.assertEqual(c["summary"]["total_reviewers"], 1)
-        self.assertEqual(c["overall_verdict"], "REQUEST_CHANGES")
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+
+    def test_empty_unregistered_stream_ignored(self):
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        (self.stream / "zz.jsonl").write_text("")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "APPROVE")
 
     # P2s
     def test_unknown_severity_rejected_and_conservative(self):
@@ -291,3 +297,146 @@ class TestLegacyGoFixture(unittest.TestCase):
                                capture_output=True, text=True, timeout=120)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn(want, r.stdout)
+
+
+class TestReviewRound3(unittest.TestCase):
+    """Fixes from Parallax re-review at f48df76 (MTSMU P1-r2-01 etc., Quilter P1-01 etc.)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wags_r3_")
+        self.ws = WagsWorkspace(self.tmp)
+        tgt = Path(self.tmp) / "t.md"
+        tgt.write_text("# t\n", encoding="utf-8")
+        self.rid = self.ws.init_review(tgt, review_id="rev-r3")["review_id"]
+        for r in ("a", "b"):
+            self.ws.register_reviewer(self.rid, r)
+        self.dir = Path(self.tmp) / "reviews" / self.rid
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _go(self, cmd="converge"):
+        if shutil.which("go") is None:
+            self.skipTest("go not installed")
+        import os
+        return subprocess.run(["go", "run", "wags.go", cmd, self.rid], cwd=GO_DIR,
+                              env=dict(os.environ, WAGS_WORKSPACE=self.tmp),
+                              capture_output=True, text=True, timeout=120).stdout
+
+    def _veto_then_converge(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "a", findings=[_f("X", "P0")], verdict="block")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")  # sets anchors
+
+    # MTSMU P1-r2-01: truncation / deletion vs anchor
+    def test_truncation_after_anchor_blocks(self):
+        self._veto_then_converge()
+        p = self.dir / "a.jsonl"
+        p.write_text(p.read_text().splitlines()[0] + "\n")
+        self.assertTrue(self.ws.verify_review(self.rid)["valid"])  # hash chain alone can't see it
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertEqual([x["reviewer"] for x in c["regressed_streams"]], ["a"])
+        # BLOCK persists (old anchor kept)
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+
+    def test_truncation_go_parity(self):
+        self._veto_then_converge()
+        p = self.dir / "a.jsonl"
+        p.write_text(p.read_text().splitlines()[0] + "\n")
+        self.assertIn("BLOCK", self._go())
+
+    def test_deleted_and_emptied_stream_block(self):
+        self._veto_then_converge()
+        (self.dir / "a.jsonl").unlink()
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+        (self.dir / "a.jsonl").write_text("")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+
+    def test_no_anchor_truncation_is_undetectable(self):
+        """Documented limit: without a prior convergence anchor, truncation is invisible."""
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "a", findings=[_f("X", "P0")], verdict="block")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        p = self.dir / "a.jsonl"
+        p.write_text(p.read_text().splitlines()[0] + "\n")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "APPROVE")
+
+    def test_growth_after_anchor_is_fine(self):
+        self._veto_then_converge()
+        self.ws.submit_entry(self.rid, "a", verdict="approve", resolves=["X"])
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "APPROVE")
+
+    # Quilter P1-01: deregistering a vetoer
+    def test_deregistered_vetoer_blocks(self):
+        self.ws.submit_entry(self.rid, "a", findings=[_f("X", "P0")], verdict="block")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        reg = json.loads((self.dir / "reviewers.json").read_text())
+        del reg["a"]
+        (self.dir / "reviewers.json").write_text(json.dumps(reg))
+        self.assertFalse(self.ws.verify_review(self.rid)["valid"])
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertIn("a", c["unregistered_streams"])
+        self.assertIn("BLOCK", self._go())
+
+    # Quilter P2-01 / MTSMU registry P2
+    def test_wiped_registry_does_not_enable_legacy_on_020(self):
+        self.ws.submit_entry(self.rid, "a", verdict="defer")
+        self.ws.submit_entry(self.rid, "b", verdict="defer")
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "DEFER")
+        (self.dir / "reviewers.json").write_text("{}")
+        self.ws.submit_entry(self.rid, "e1", verdict="approve")
+        self.ws.submit_entry(self.rid, "e2", verdict="approve")
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["registry_mode"], "registered")
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertIn("BLOCK", self._go())
+        (self.dir / "reviewers.json").unlink()
+        self.assertEqual(self.ws.converge_review(self.rid)["overall_verdict"], "BLOCK")
+
+    # Quilter P3-01: legacy hash form only for 0.1.0 targets, never after canonical
+    def _restamp_legacy(self, line_no):
+        from wags import StreamEntry
+        p = self.dir / "a.jsonl"
+        lines = p.read_text().splitlines()
+        d = json.loads(lines[line_no])
+        e = StreamEntry(**{k: d[k] for k in ["sequence", "timestamp", "review_id", "reviewer", "phase",
+                                             "prev_hash", "findings", "verdict", "rebuttal_to", "metadata"]})
+        d["entry_hash"] = e.compute_legacy_go_hash()
+        lines[line_no] = json.dumps(d)
+        p.write_text("\n".join(lines) + "\n")
+
+    def test_legacy_hash_rejected_on_020_target(self):
+        self.ws.submit_entry(self.rid, "a", findings=[Finding("x", "P2", "s", "<b> & c", "e", "r")], verdict="approve")
+        self._restamp_legacy(0)
+        self.assertFalse(self.ws.verify_review(self.rid)["valid"])
+        self.assertIn("BLOCK", self._go())
+
+    def test_legacy_after_canonical_rejected_on_010_target(self):
+        # (legacy-only streams on 0.1.0 targets verify: see TestLegacyGoFixture)
+        shutil.rmtree(self.dir)
+        self.setUp_review_010()
+        self.ws.submit_entry(self.rid, "a", findings=[Finding("x", "P2", "s", "plain", "e", "r")], verdict="approve")
+        self.ws.submit_entry(self.rid, "a", findings=[Finding("y", "P2", "s", "<&>", "e", "r")], verdict="approve")
+        self._restamp_legacy(1)
+        v = self.ws.verify_review(self.rid)
+        self.assertFalse(v["valid"])
+        self.assertTrue(any("legacy-form" in e for e in v["streams"]["a"]["errors"]))
+
+    def setUp_review_010(self):
+        tgt = Path(self.tmp) / "t.md"
+        self.ws.init_review(tgt, review_id=self.rid)
+        for r in ("a", "b"):
+            self.ws.register_reviewer(self.rid, r)
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+
+    # MTSMU P2: empty refs
+    def test_empty_resolves_supersedes_rejected(self):
+        self.ws.submit_entry(self.rid, "a", findings=[_f("X", "P1")], verdict="request_changes")
+        for kw in (dict(resolves=[]), dict(supersedes=[])):
+            with self.assertRaises(ValueError):
+                self.ws.submit_entry(self.rid, "a", verdict="approve", **kw)
