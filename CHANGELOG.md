@@ -35,6 +35,28 @@
 - Documented: a garbage registered stream (or unregistered stream with content) can stall a
   review. This is the deliberate fail-closed trade-off.
 
+### Security / integrity (Parallax round 3)
+- **Protocol-downgrade fix:** `converged.json` records `anchor_context` (target protocol,
+  registry mode, registered reviewers). A later downgrade to 0.1.0, a switch to legacy mode, or a
+  disappeared registered reviewer gives BLOCK and is listed in `anchor_problems`. Legacy count-all
+  mode now also requires no 0.2.0 markers (resolves/supersedes, `index.json` 0.2.0, a recorded
+  registered mode), and is never re-entered once registered mode has been recorded. A 0.1.0
+  target using resolves/supersedes gives BLOCK. The legacy Go hash form is likewise rejected
+  when 0.2.0 markers exist.
+- **Unparseable `converged.json` fails closed** (BLOCK, `anchor_status: "unparseable"`,
+  persistent `anchor_lost`). New `anchor_status` field: absent / present / unparseable.
+- **Quorum:** by default every registered reviewer must have voted before APPROVE (otherwise
+  DEFER, "pending quorum"). `min_quorum` option in Python, both CLIs, and Go `ConvergeReviewOpts`.
+- `index.json` per-review entries record `protocol_version`. Go `InitReview` now updates
+  `index.json` (parity).
+- The unregistered-stream error names the stream and its entry count (no more "line 0").
+- Spec 4.6 lists the limits of unsigned files (pre-anchor deletion, anchor deletion/edit,
+  joint rollback, rename without an anchor).
+
+### Note on unreleased intermediate builds
+- Go logs written by the round-1 build of this PR (never released) may fail `verify`. Only
+  0.1.0 (released) and final 0.2.0 formats are supported.
+
 ### Added
 - Optional `metadata.resolves` (finding ids) and `metadata.supersedes` (entry hashes), in Python
   and Go. They are **positional**: they close only finding instances raised in the same reviewer's
