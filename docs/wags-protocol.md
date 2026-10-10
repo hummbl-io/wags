@@ -127,19 +127,25 @@ Each line is a JSON object with cryptographic chaining:
 - **`N` (Note / Praise)**: Positive verification or context observation.
 
 ### 4.2 Consensus Decision Rules (protocol 0.2.0)
-Convergence is computed **per reviewer stream**, in append order:
+**Step 0: integrity and registration.** Before counting anything, convergence runs `verify`:
+- Streams whose reviewer is not in `reviewers.json` are **excluded** and listed in `unregistered_streams`. Legacy exception: if `reviewers.json` is empty (wags-go 0.1.0 never populated it), every stream counts and `registry_empty: true` is reported.
+- Registered streams that fail verification (bad hash, broken `prev_hash`, `sequence` not 1..n in file order, `reviewer` not matching the stream name, invalid resolution refs) are **excluded** and listed in `invalid_streams`. **If any registered stream is invalid, the overall verdict is `BLOCK`**: a tampered or corrupt log could be hiding a veto, so the safe result is to stop, not to approve without it.
 
-- **Latest verdict wins.** A reviewer's vote is the `verdict` of their most recent entry that has one. Earlier verdicts are history, not votes.
-- **Only open findings count.** A finding is *open* unless a **later entry in the same reviewer's stream** resolves it (see 4.3). Resolved findings stay in the log and are reported in `converged.json` under `resolved_findings`; `findings_by_severity` counts open findings only.
+Then, per valid stream, processed in `sequence` order:
+- **Latest verdict wins.** A reviewer's vote is the `verdict` of their highest-sequence entry that has one. A later entry with no verdict does not reset the vote.
+- **Only open findings count.** See 4.3 for when a finding is resolved. Resolved findings stay in the log and are reported in `resolved_findings`.
 
 Rules, in order:
-1. **P0 Rule (Absolute Veto)**: Any **open** `P0` finding, or any reviewer whose latest verdict is `block`, makes the overall verdict **`BLOCK`**. An approving reviewer cannot veto-proof their own open P0; they must resolve it explicitly.
-2. **P1 Rule**: Any reviewer whose latest verdict is `request_changes`, or any **open** `P1` whose reviewer's latest verdict is not `approve`, makes the verdict **`REQUEST_CHANGES`**. (An open P1 from a reviewer whose latest verdict is `approve` is reported in `open_findings` but does not block.)
-3. **Majority Approval**: If there are no blockers and $\ge 50\%$ of reviewers with a verdict submit `approve`, the verdict is **`APPROVE`**.
-4. **Tie / Inconclusive**: Otherwise **`DEFER`** pending operator intervention.
+1. **P0 Rule (Absolute Veto)**: any **open** `P0`, or any latest verdict `block`, gives **`BLOCK`**. Findings with an unrecognised severity are treated as `P0` (listed in `unknown_severity_findings`). Implementations reject unknown severities at submit.
+2. **P1 Rule**: any latest verdict `request_changes`, or any **open** `P1` whose reviewer's latest verdict is not `approve`, gives **`REQUEST_CHANGES`**.
+   - **Policy change from 0.1.0:** an open P1 raised by a reviewer whose latest verdict is `approve` **no longer blocks**. That reviewer has accepted their own finding as non-blocking. The finding still appears in `open_findings` and `open_findings_by_severity`. To keep it blocking, the reviewer should vote `request_changes`.
+3. **Majority Approval**: if there are no blockers and at least 50% of reviewers with a verdict submit `approve`, the verdict is **`APPROVE`**.
+4. **Tie / Inconclusive**: otherwise **`DEFER`**.
+
+`summary.findings_by_severity` counts **all** findings from valid registered streams, as in 0.1.0. `summary.open_findings_by_severity` counts open findings only, **including non-blocking open P1s**.
 
 ### 4.3 Resolving and Superseding Findings
-An entry MAY carry, inside `metadata` (which is already covered by `entry_hash`, so the hash format is unchanged):
+An entry MAY carry, inside `metadata` (already covered by `entry_hash`, so the hash format is unchanged):
 
 ```json
 "metadata": {
@@ -148,15 +154,25 @@ An entry MAY carry, inside `metadata` (which is already covered by `entry_hash`,
 }
 ```
 
-- `resolves`: list of finding `id`s. Each MUST appear in an **earlier entry of the same reviewer's stream**.
-- `supersedes`: list of `entry_hash` values. Each MUST be an **earlier entry of the same reviewer's stream**; all findings raised in those entries become resolved.
-- A reviewer can never resolve another reviewer's findings. Implementations MUST reject such refs at submit time, and `verify` MUST mark a stream containing invalid refs as invalid. Convergence ignores invalid refs.
-- Entries are never rewritten; resolution is purely additive, preserving append-only and hash-chain guarantees.
+- `resolves`: a list of finding `id` strings. Each MUST appear in an **earlier** entry of the **same reviewer's** stream.
+- `supersedes`: a list of `entry_hash` strings. Each MUST name an **earlier** entry of the **same reviewer's** stream. All findings raised in those entries become resolved. `supersedes` resolves **findings only**: it does not retract the earlier entry's verdict, which is simply replaced by the reviewer's latest verdict.
+- `null`, non-list, or non-string values are invalid. `metadata` itself must be a JSON object.
+- **Positional rule:** a resolving entry at sequence *k* closes only finding **instances** raised in entries with sequence < *k*. If the same id is raised again at a sequence > *k*, it is a new, **open** instance and needs a new, later resolution. An entry cannot resolve findings it raises itself.
+- A reviewer can never resolve another reviewer's findings. Invalid refs are rejected at submit, make the stream fail `verify` (and so trigger the Step 0 BLOCK), and are ignored by convergence.
+- Entries are never rewritten. Resolution only adds new entries.
 
-**Backward compatibility:** logs written by 0.1.0 (no `resolves`/`supersedes`) verify unchanged and converge with the latest-verdict rule. Ad-hoc metadata keys (e.g. `resolved_findings`) carry no protocol meaning.
+**Backward compatibility:** 0.1.0 logs (no `resolves`/`supersedes`) verify and converge with the latest-verdict rule. Ad-hoc metadata keys (e.g. `resolved_findings`, `supersedes_entries`) carry **no** protocol meaning; findings they mention stay open.
 
 ### 4.4 Canonical JSON
-Entry hashes are SHA-256 over JSON with sorted keys, separators `,` and `:`, UTF-8, non-ASCII emitted raw, and **no HTML escaping** (`<`, `>`, `&` emitted literally), matching Python `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
+Entry hashes are SHA-256 over the UTF-8 encoding of Python's `json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`:
+- keys are sorted, and there is no whitespace;
+- non-ASCII characters, including U+2028/U+2029, are emitted raw;
+- there is no HTML escaping (`<`, `>`, `&` are literal);
+- only `"`, `\` and control characters below U+0020 are escaped;
+- numbers keep their literal form (`1.0`, `-0.0`, `1e-07`, big integers). The Go implementation decodes with `json.Number` and uses its own encoder to preserve this.
+
+### 4.5 Legacy Go Hashes
+wags-go 0.1.0 hashed with `encoding/json.Marshal`, which escapes `<`, `>`, `&` as `\u003c`/`\u003e`/`\u0026` and U+2028/U+2029 as `\u2028`/`\u2029`. For compatibility, `verify` (in both implementations) **accepts** an entry whose stored hash matches either the canonical hash or this legacy encoding. New entries are always written with the canonical hash.
 
 ---
 
