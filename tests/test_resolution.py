@@ -576,3 +576,177 @@ class TestReviewRound4(unittest.TestCase):
         t["protocol_version"] = "0.1.0"
         (self.dir / "target.json").write_text(json.dumps(t))
         self.assertFalse(self.ws.verify_review(self.rid)["valid"])
+
+
+class TestReviewRound5(unittest.TestCase):
+    """Final round (reviews at 2cf5040): min_quorum validation, chained protocol marker, anchor_status."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wags_r5_")
+        self.ws = WagsWorkspace(self.tmp)
+        tgt = Path(self.tmp) / "t.md"
+        tgt.write_text("# t\n", encoding="utf-8")
+        self.tgt = tgt
+        self.rid = self.ws.init_review(tgt, review_id="rev-r5")["review_id"]
+        for r in ("a", "b", "c"):
+            self.ws.register_reviewer(self.rid, r)
+        self.dir = Path(self.tmp) / "reviews" / self.rid
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _go(self, *args, rid=None):
+        if shutil.which("go") is None:
+            self.skipTest("go not installed")
+        import os
+        return subprocess.run(["go", "run", "wags.go", "converge", rid or self.rid, *args], cwd=GO_DIR,
+                              env=dict(os.environ, WAGS_WORKSPACE=self.tmp),
+                              capture_output=True, text=True, timeout=120)
+
+    def _pycli(self, *args):
+        import sys
+        return subprocess.run([sys.executable, "-c", "import sys,wags; sys.exit(wags.main())",
+                               "--workspace", self.tmp, "converge", self.rid, *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_min_quorum_python_cli_rejects_bad_values(self):
+        self._two_approve()
+        for bad in ("0", "-1", "1.5", "abc", "true", "\u00b2"):
+            r = self._pycli("--min-quorum", bad)
+            self.assertNotEqual(r.returncode, 0, bad)
+            self.assertIn("min_quorum must be a positive integer", r.stderr)
+        r = self._pycli("--min-quorum", "2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _two_approve(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+
+    # Finding 1: min_quorum validation
+    def test_min_quorum_api_rejects_bad_values(self):
+        self._two_approve()
+        for bad in (0, -1, -5, 1.5, True, False, "2", "abc", 2.0):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.ws.converge_review(self.rid, min_quorum=bad)
+        c = self.ws.converge_review(self.rid, min_quorum=2)
+        self.assertEqual(c["overall_verdict"], "APPROVE")
+        self.assertEqual(c["quorum"]["min_quorum"], 2)
+
+    def test_min_quorum_cli_rejects_bad_values_py_and_go(self):
+        self._two_approve()
+        for bad in ("0", "-1", "1.5", "abc", "true", " 2"):
+            g = self._go("-min-quorum", bad)
+            self.assertNotEqual(g.returncode, 0, bad)
+            self.assertIn("min_quorum must be a positive integer", g.stderr)
+        g = self._go("-min-quorum", "2")
+        self.assertEqual(g.returncode, 0, g.stdout + g.stderr)
+        self.assertIn("APPROVE", g.stdout)
+
+    def test_min_quorum_above_registered_defers_with_warning(self):
+        self._two_approve()
+        self.ws.submit_entry(self.rid, "c", verdict="approve")
+        c = self.ws.converge_review(self.rid, min_quorum=5)
+        self.assertEqual(c["overall_verdict"], "DEFER")
+        self.assertIn("exceeds", c["quorum"]["warning"])
+        self.assertIn("DEFER", self._go("-min-quorum", "5").stdout)
+
+    def test_defer_counts_toward_quorum(self):
+        self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.ws.submit_entry(self.rid, "b", verdict="approve")
+        self.ws.submit_entry(self.rid, "c", verdict="defer")
+        c = self.ws.converge_review(self.rid)
+        self.assertTrue(c["quorum_met"])
+        self.assertEqual(c["overall_verdict"], "APPROVE")
+
+    # Finding 3: hash-chained protocol marker
+    def test_new_entries_carry_marker_only_for_020_targets(self):
+        e = self.ws.submit_entry(self.rid, "a", verdict="approve")
+        self.assertEqual(e.metadata.get("wags_protocol"), "0.2.0")
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+        e2 = self.ws.submit_entry(self.rid, "b", verdict="approve")
+        self.assertNotIn("wags_protocol", e2.metadata)
+
+    def _ncase(self, anchored, scrub_index, ctx=None):
+        self.ws.submit_entry(self.rid, "a", verdict="defer")
+        self.ws.submit_entry(self.rid, "b", verdict="defer")
+        self.ws.submit_entry(self.rid, "c", verdict="defer")
+        if anchored:
+            self.ws.converge_review(self.rid)
+        self.ws.submit_entry(self.rid, "evil", verdict="approve")
+        self.ws.submit_entry(self.rid, "evil2", verdict="approve")
+        (self.dir / "reviewers.json").write_text("{}")
+        t = json.loads((self.dir / "target.json").read_text())
+        t["protocol_version"] = "0.1.0"
+        (self.dir / "target.json").write_text(json.dumps(t))
+        if scrub_index:
+            ip = Path(self.tmp) / "index.json"
+            idx = json.loads(ip.read_text())
+            idx["protocol_version"] = "0.1.0"
+            idx["reviews"][self.rid].pop("protocol_version", None)
+            ip.write_text(json.dumps(idx))
+        if ctx == "delete_converged":
+            (self.dir / "converged.json").unlink()
+        elif ctx in ("edit", "remove"):
+            c = json.loads((self.dir / "converged.json").read_text())
+            if ctx == "edit":
+                c["anchor_context"] = {"protocol_version": "0.1.0", "registry_mode": "legacy_all_streams",
+                                       "registered_reviewers": []}
+            else:
+                c.pop("anchor_context")
+            (self.dir / "converged.json").write_text(json.dumps(c))
+        c = self.ws.converge_review(self.rid)
+        self.assertEqual(c["overall_verdict"], "BLOCK")
+        self.assertEqual(c["registry_mode"], "registered")
+        self.assertIn("BLOCK", self._go().stdout)
+
+    def test_N1_preanchor_downgrade_scrubbed_index(self):
+        self._ncase(False, True)
+
+    def test_N2_converged_deleted_scrubbed_index(self):
+        self._ncase(True, True, "delete_converged")
+
+    def test_N4_anchor_context_edited_scrubbed_index(self):
+        self._ncase(True, True, "edit")
+
+    def test_N5_anchor_context_removed_scrubbed_index(self):
+        self._ncase(True, True, "remove")
+
+    # Finding 4
+    def test_present_no_context(self):
+        for r in "abc":
+            self.ws.submit_entry(self.rid, r, verdict="approve")
+        self.ws.converge_review(self.rid)
+        c = json.loads((self.dir / "converged.json").read_text())
+        c.pop("anchor_context")
+        (self.dir / "converged.json").write_text(json.dumps(c))
+        g = self._go()
+        self.assertIn("APPROVE", g.stdout)
+        gc = json.loads((self.dir / "converged.json").read_text())
+        (self.dir / "converged.json").write_text(json.dumps(c))
+        out = self.ws.converge_review(self.rid)
+        self.assertEqual(out["anchor_status"], "present_no_context")
+        self.assertEqual(gc["anchor_status"], "present_no_context")
+        self.assertEqual(out["overall_verdict"], "APPROVE")
+
+
+class TestConcurrentConverge(unittest.TestCase):
+    def test_parallel_converges_never_see_partial_files(self):
+        import concurrent.futures as cf
+        tmp = tempfile.mkdtemp(prefix="wags_cc_")
+        try:
+            ws = WagsWorkspace(tmp)
+            t = Path(tmp) / "t.md"
+            t.write_text("x")
+            rid = ws.init_review(t, review_id="rev-cc")["review_id"]
+            for r in ("a", "b"):
+                ws.register_reviewer(rid, r)
+                ws.submit_entry(rid, r, verdict="approve")
+            ws.converge_review(rid)
+            with cf.ThreadPoolExecutor(8) as ex:
+                res = list(ex.map(lambda _: WagsWorkspace(tmp).converge_review(rid)["overall_verdict"], range(32)))
+            self.assertEqual(set(res), {"APPROVE"})
+            json.loads((Path(tmp) / "reviews" / rid / "converged.json").read_text())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)

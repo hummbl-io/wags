@@ -18,6 +18,26 @@ import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 PROTOCOL_VERSION = "0.2.0"
+def validate_min_quorum(value: Any) -> Optional[int]:
+    """None (default: all registered reviewers) or an int >= 1. Rejects bools,
+    floats, strings, 0 and negatives. Identical rule in Go."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"min_quorum must be a positive integer (>= 1); got {value!r}")
+    return value
+
+
+def _cli_min_quorum(text: str) -> int:
+    import argparse
+    if not (text.isascii() and text.isdigit()):
+        raise argparse.ArgumentTypeError(f"min_quorum must be a positive integer (>= 1); got {text!r}")
+    try:
+        return validate_min_quorum(int(text))  # type: ignore[return-value]
+    except ValueError as ex:
+        raise argparse.ArgumentTypeError(str(ex))
+
+
 VALID_SEVERITIES = ("P0", "P1", "P2", "P3", "N")
 GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000"
 
@@ -25,6 +45,25 @@ GENESIS_HASH = "0000000000000000000000000000000000000000000000000000000000000000
 def _canonical_json(data: Any) -> str:
     """Deterministic JSON serialization without whitespace drift."""
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON via temp file + os.replace so concurrent readers never see a partial file."""
+    import os
+    import tempfile
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _compute_sha256(content_bytes: bytes) -> str:
@@ -158,8 +197,7 @@ class WagsWorkspace:
             return {"protocol_version": PROTOCOL_VERSION, "reviews": {}}
 
     def _write_index(self, data: Dict[str, Any]) -> None:
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(self.index_file, data)
 
     def init_review(
         self,
@@ -201,11 +239,9 @@ class WagsWorkspace:
             "status": "OPEN",
         }
 
-        with open(rev_dir / "target.json", "w", encoding="utf-8") as f:
-            json.dump(target_manifest, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(rev_dir / "target.json", target_manifest)
 
-        with open(rev_dir / "reviewers.json", "w", encoding="utf-8") as f:
-            json.dump({}, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(rev_dir / "reviewers.json", {})
 
         # Update index
         idx = self._read_index()
@@ -243,8 +279,7 @@ class WagsWorkspace:
             "has_hmac": bool(secret_key),
         }
 
-        with open(reg_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(reg_file, data)
 
         # Ensure reviewer JSONL file exists
         stream_path = rev_dir / f"{reviewer_name}.jsonl"
@@ -320,6 +355,13 @@ class WagsWorkspace:
             errs = self._check_resolution_refs(prior, md.get("resolves", []), md.get("supersedes", []), md)
             if errs:
                 raise ValueError("; ".join(errs))
+
+        # Hash-chained protocol marker: new entries in reviews whose target is NOT
+        # 0.1.0 carry metadata.wags_protocol, so a later downgrade of target.json is
+        # detectable from the chain itself (0.1.0 reviews stay unmarked).
+        if self._target_protocol(rev_dir) != "0.1.0":
+            metadata = dict(metadata or {})
+            metadata["wags_protocol"] = PROTOCOL_VERSION
 
         last_seq, prev_hash = self._get_reviewer_last_entry(review_id, reviewer_name)
         new_seq = last_seq + 1
@@ -502,6 +544,8 @@ class WagsWorkspace:
                 md = d.get("metadata")
                 if isinstance(md, dict) and ("resolves" in md or "supersedes" in md):
                     found.append(f"{path.stem} seq {d.get('sequence')}: resolves/supersedes")
+                if isinstance(md, dict) and str(md.get("wags_protocol", "0.1.0")) != "0.1.0":
+                    found.append(f"{path.stem} seq {d.get('sequence')}: chained wags_protocol {md.get('wags_protocol')}")
         try:
             with open(rev_dir.parent.parent / "index.json", "r", encoding="utf-8") as f:
                 idx = json.load(f)
@@ -638,6 +682,7 @@ class WagsWorkspace:
           P1 whose reviewer's latest verdict is not ``approve``.
         - Otherwise APPROVE on >= 50% approve, else DEFER.
         """
+        min_quorum = validate_min_quorum(min_quorum)
         rev_dir = self.reviews_dir / review_id
         if not rev_dir.exists():
             raise ValueError(f"Review {review_id} not found")
@@ -679,6 +724,9 @@ class WagsWorkspace:
             feats = self._uses_020_features(rev_dir)
             if feats and not self._registered(rev_dir):
                 anchor_problems.append("target.json says 0.1.0 but review uses 0.2.0 features: " + "; ".join(feats))
+            elif any("chained wags_protocol" in x for x in feats):
+                anchor_problems.append("protocol downgrade: target.json says 0.1.0 but hash-chained entries are "
+                                       + "; ".join(x for x in feats if "chained wags_protocol" in x))
             elif any("resolves/supersedes" in x for x in feats):
                 anchor_problems.append("target.json says 0.1.0 but entries use resolves/supersedes (0.2.0): "
                                        + "; ".join(x for x in feats if "resolves/supersedes" in x))
@@ -753,8 +801,12 @@ class WagsWorkspace:
         # Quorum: by default every registered reviewer must have a latest verdict
         # before the review can APPROVE (min_quorum overrides; legacy mode = voters).
         quorum_required = (len(registered) if registry_mode == "registered" else total_reviewers) \
-            if min_quorum is None else int(min_quorum)
-        quorum_met = total_reviewers > 0 and total_reviewers >= quorum_required
+            if min_quorum is None else min_quorum
+        quorum_warning = None
+        if min_quorum is not None and registry_mode == "registered" and min_quorum > len(registered):
+            quorum_warning = (f"min_quorum {min_quorum} exceeds the {len(registered)} registered reviewer(s); "
+                              f"quorum can never be met")
+        quorum_met = total_reviewers > 0 and total_reviewers >= quorum_required and quorum_warning is None
 
         if anchor_problems:
             overall_verdict = "BLOCK"
@@ -773,6 +825,9 @@ class WagsWorkspace:
         elif blocking_p1 > 0 or verdict_counts.get("request_changes", 0) > 0:
             overall_verdict = "REQUEST_CHANGES"
             rationale = f"Changes required: {blocking_p1} blocking open P1 finding(s) or request_changes vote(s)."
+        elif quorum_warning:
+            overall_verdict = "DEFER"
+            rationale = "Pending quorum: " + quorum_warning
         elif not quorum_met:
             overall_verdict = "DEFER"
             rationale = (f"Pending quorum: {total_reviewers}/{quorum_required} required reviewers have voted "
@@ -808,6 +863,8 @@ class WagsWorkspace:
                 "registered_reviewers": sorted(set(registered) | set(prev_ctx.get("registered_reviewers") or []))
                 if anchor_problems else sorted(registered),
             }
+        if anchor_status == "present" and not isinstance(prev.get("anchor_context"), dict):
+            anchor_status = "present_no_context"  # older converged.json (pre round-3)
         anchor_lost = bool(prev.get("anchor_lost")) or anchor_status == "unparseable"
         if anchor_status == "unparseable":
             anchors = {}
@@ -821,7 +878,7 @@ class WagsWorkspace:
             "rationale": rationale,
             "quorum_met": quorum_met,
             "quorum": {"required": quorum_required, "voted": total_reviewers, "registered": len(registered),
-                       "min_quorum": min_quorum},
+                       "min_quorum": min_quorum, "warning": quorum_warning},
             "anchor_status": anchor_status,
             "anchor_problems": anchor_problems,
             "anchor_context": anchor_context,
@@ -847,14 +904,12 @@ class WagsWorkspace:
             "all_findings": all_findings,
         }
 
-        with open(rev_dir / "converged.json", "w", encoding="utf-8") as f:
-            json.dump(converged_manifest, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(rev_dir / "converged.json", converged_manifest)
 
         # Update target status
         target_data["status"] = "CONVERGED"
         target_data["current_phase"] = "convergence"
-        with open(target_file, "w", encoding="utf-8") as f:
-            json.dump(target_data, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(target_file, target_data)
 
         return converged_manifest
 
@@ -905,7 +960,7 @@ def main() -> int:
     # converge
     p_conv = subparsers.add_parser("converge", help="Calculate consensus and converge review")
     p_conv.add_argument("review_id", help="Review ID")
-    p_conv.add_argument("--min-quorum", type=int, default=None,
+    p_conv.add_argument("--min-quorum", type=_cli_min_quorum, default=None,
                         help="Minimum reviewers with a verdict before APPROVE (default: all registered)")
 
     # list

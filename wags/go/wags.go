@@ -48,6 +48,27 @@ type StreamEntry struct {
 	Signature  string                   `json:"signature,omitempty"`
 }
 
+// atomicWriteFile writes via a temp file + rename so concurrent readers never
+// observe a partially written file. Mirrors Python _atomic_write_json.
+func atomicWriteFile(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	_ = os.Chmod(tmp, 0644)
+	return os.Rename(tmp, path)
+}
+
 func computeSHA256(data []byte) string {
 	h := sha256.Sum256(data)
 	return hex.EncodeToString(h[:])
@@ -355,7 +376,7 @@ func NewWagsWorkspace(root string) (*WagsWorkspace, error) {
 			"reviews":          map[string]interface{}{},
 		}
 		data, _ := json.MarshalIndent(initIndex, "", "  ")
-		_ = os.WriteFile(indexFile, data, 0644)
+		_ = atomicWriteFile(indexFile, data)
 	}
 	return ws, nil
 }
@@ -399,10 +420,10 @@ func (ws *WagsWorkspace) InitReview(targetPath, targetType, desc, initiator, cus
 	}
 
 	data, _ := json.MarshalIndent(manifest, "", "  ")
-	if err := os.WriteFile(filepath.Join(revDir, "target.json"), data, 0644); err != nil {
+	if err := atomicWriteFile(filepath.Join(revDir, "target.json"), data); err != nil {
 		return nil, err
 	}
-	_ = os.WriteFile(filepath.Join(revDir, "reviewers.json"), []byte("{}"), 0644)
+	_ = atomicWriteFile(filepath.Join(revDir, "reviewers.json"), []byte("{}"))
 
 	// Record the review in index.json (parity with Python), including protocol_version.
 	idx := map[string]interface{}{"protocol_version": ProtocolVersion, "reviews": map[string]interface{}{}}
@@ -422,7 +443,7 @@ func (ws *WagsWorkspace) InitReview(targetPath, targetType, desc, initiator, cus
 	}
 	idx["reviews"] = rv
 	if b, err := json.MarshalIndent(idx, "", "  "); err == nil {
-		_ = os.WriteFile(ws.IndexFile, b, 0644)
+		_ = atomicWriteFile(ws.IndexFile, b)
 	}
 
 	return manifest, nil
@@ -444,7 +465,7 @@ func (ws *WagsWorkspace) RegisterReviewer(reviewID, reviewerName, secretKey, rol
 		"has_hmac":      secretKey != "",
 	}
 	if b, err := json.MarshalIndent(reg, "", "  "); err == nil {
-		_ = os.WriteFile(regFile, b, 0644)
+		_ = atomicWriteFile(regFile, b)
 	}
 	streamPath := filepath.Join(revDir, reviewerName+".jsonl")
 	if _, err := os.Stat(streamPath); os.IsNotExist(err) {
@@ -491,6 +512,15 @@ func (ws *WagsWorkspace) SubmitEntryWithMetadata(reviewID, reviewerName, phase s
 
 	if metadata == nil {
 		metadata = map[string]interface{}{}
+	}
+	// Hash-chained protocol marker (not for 0.1.0 targets). Mirrors Python.
+	if targetProtocol(revDir) != "0.1.0" {
+		md := make(map[string]interface{}, len(metadata)+1)
+		for k, v := range metadata {
+			md[k] = v
+		}
+		md["wags_protocol"] = ProtocolVersion
+		metadata = md
 	}
 	for _, f := range findings {
 		if !validSeverity(f.Severity) {
@@ -652,6 +682,9 @@ func uses020Features(revDir string) []string {
 			_, sp := e.Metadata["supersedes"]
 			if r || sp {
 				found = append(found, fmt.Sprintf("%s seq %d: resolves/supersedes", name, e.Sequence))
+			}
+			if wp, ok := e.Metadata["wags_protocol"]; ok && fmt.Sprintf("%v", wp) != "0.1.0" {
+				found = append(found, fmt.Sprintf("%s seq %d: chained wags_protocol %v", name, e.Sequence, wp))
 			}
 		}
 	}
@@ -930,11 +963,50 @@ func streamState(entries []StreamEntry) (string, []map[string]interface{}, []map
 
 // ConvergeReview: latest verdict per reviewer + open findings only (protocol 0.2.0).
 func (ws *WagsWorkspace) ConvergeReview(reviewID string) (map[string]interface{}, error) {
-	return ws.ConvergeReviewOpts(reviewID, -1)
+	return ws.ConvergeReviewOpts(reviewID, nil)
+}
+
+func filterContains(xs []string, sub string) []string {
+	out := []string{}
+	for _, x := range xs {
+		if strings.Contains(x, sub) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// ValidateMinQuorum: nil (default: all registered) or an integer >= 1.
+func ValidateMinQuorum(v *int) error {
+	if v != nil && *v < 1 {
+		return fmt.Errorf("min_quorum must be a positive integer (>= 1); got %d", *v)
+	}
+	return nil
+}
+
+// ParseMinQuorum parses a CLI value with the same rule as Python: ASCII digits only, >= 1.
+func ParseMinQuorum(text string) (*int, error) {
+	if text == "" {
+		return nil, nil
+	}
+	for _, r := range text {
+		if r < '0' || r > '9' {
+			return nil, fmt.Errorf("min_quorum must be a positive integer (>= 1); got %q", text)
+		}
+	}
+	n, err := strconv.Atoi(text)
+	if err != nil || n < 1 {
+		return nil, fmt.Errorf("min_quorum must be a positive integer (>= 1); got %q", text)
+	}
+	return &n, nil
 }
 
 // ConvergeReviewOpts: minQuorum < 0 means "every registered reviewer must vote".
-func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map[string]interface{}, error) {
+// ConvergeReviewOpts: minQuorum nil = every registered reviewer must vote; otherwise >= 1.
+func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum *int) (map[string]interface{}, error) {
+	if err := ValidateMinQuorum(minQuorum); err != nil {
+		return nil, err
+	}
 	revDir := filepath.Join(ws.ReviewsDir, reviewID)
 	targetBytes, err := os.ReadFile(filepath.Join(revDir, "target.json"))
 	if err != nil {
@@ -1007,6 +1079,8 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 		feats := uses020Features(revDir)
 		if len(feats) > 0 && len(registered) == 0 {
 			anchorProblems = append(anchorProblems, "target.json says 0.1.0 but review uses 0.2.0 features: "+strings.Join(feats, "; "))
+		} else if cw := filterContains(feats, "chained wags_protocol"); len(cw) > 0 {
+			anchorProblems = append(anchorProblems, "protocol downgrade: target.json says 0.1.0 but hash-chained entries are "+strings.Join(cw, "; "))
 		} else {
 			rs := []string{}
 			for _, x := range feats {
@@ -1132,15 +1206,21 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 	overallVerdict := "DEFER"
 	rationale := "Insufficient quorum or inconclusive vote."
 
-	quorumRequired := minQuorum
-	if minQuorum < 0 {
+	quorumRequired := 0
+	var quorumWarning interface{}
+	if minQuorum == nil {
 		if registryMode == "registered" {
 			quorumRequired = len(registered)
 		} else {
 			quorumRequired = totalReviewers
 		}
+	} else {
+		quorumRequired = *minQuorum
+		if registryMode == "registered" && *minQuorum > len(registered) {
+			quorumWarning = fmt.Sprintf("min_quorum %d exceeds the %d registered reviewer(s); quorum can never be met", *minQuorum, len(registered))
+		}
 	}
-	quorumMet := totalReviewers > 0 && totalReviewers >= quorumRequired
+	quorumMet := totalReviewers > 0 && totalReviewers >= quorumRequired && quorumWarning == nil
 
 	if len(anchorProblems) > 0 {
 		overallVerdict = "BLOCK"
@@ -1165,6 +1245,9 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 	} else if blockingP1 > 0 || verdictCounts["request_changes"] > 0 {
 		overallVerdict = "REQUEST_CHANGES"
 		rationale = fmt.Sprintf("Changes required: %d blocking open P1 finding(s) or request_changes vote(s).", blockingP1)
+	} else if quorumWarning != nil {
+		overallVerdict = "DEFER"
+		rationale = "Pending quorum: " + quorumWarning.(string)
 	} else if !quorumMet {
 		overallVerdict = "DEFER"
 		rationale = fmt.Sprintf("Pending quorum: %d/%d required reviewers have voted (%d registered).", totalReviewers, quorumRequired, len(registered))
@@ -1218,8 +1301,13 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 		anchors = map[string]interface{}{}
 	}
 	var mq interface{}
-	if minQuorum >= 0 {
-		mq = minQuorum
+	if minQuorum != nil {
+		mq = *minQuorum
+	}
+	if anchorStatus == "present" {
+		if _, ok := prev["anchor_context"].(map[string]interface{}); !ok {
+			anchorStatus = "present_no_context" // older converged.json (pre round-3)
+		}
 	}
 
 	converged := map[string]interface{}{
@@ -1230,7 +1318,7 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 		"overall_verdict":  overallVerdict,
 		"rationale":        rationale,
 		"quorum_met":       quorumMet,
-		"quorum":           map[string]interface{}{"required": quorumRequired, "voted": totalReviewers, "registered": len(registered), "min_quorum": mq},
+		"quorum":           map[string]interface{}{"required": quorumRequired, "voted": totalReviewers, "registered": len(registered), "min_quorum": mq, "warning": quorumWarning},
 		"anchor_status":    anchorStatus,
 		"anchor_problems":  anchorProblems,
 		"anchor_context":   anchorContext,
@@ -1256,7 +1344,7 @@ func (ws *WagsWorkspace) ConvergeReviewOpts(reviewID string, minQuorum int) (map
 	}
 
 	data, _ := json.MarshalIndent(converged, "", "  ")
-	_ = os.WriteFile(filepath.Join(revDir, "converged.json"), data, 0644)
+	_ = atomicWriteFile(filepath.Join(revDir, "converged.json"), data)
 
 	return converged, nil
 }
@@ -1310,9 +1398,14 @@ func main() {
 			os.Exit(1)
 		}
 		convCmd := flag.NewFlagSet("converge", flag.ExitOnError)
-		minQ := convCmd.Int("min-quorum", -1, "Minimum reviewers with a verdict before APPROVE (default: all registered)")
+		minQ := convCmd.String("min-quorum", "", "Minimum reviewers with a verdict before APPROVE, integer >= 1 (default: all registered)")
 		_ = convCmd.Parse(os.Args[3:])
-		conv, err := ws.ConvergeReviewOpts(os.Args[2], *minQ)
+		mq, perr := ParseMinQuorum(*minQ)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", perr)
+			os.Exit(2)
+		}
+		conv, err := ws.ConvergeReviewOpts(os.Args[2], mq)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)

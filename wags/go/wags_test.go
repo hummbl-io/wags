@@ -326,8 +326,21 @@ func TestGoLegacyHashOnlyFor010AndNotAfterCanonical(t *testing.T) {
 	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
 		t.Fatal("0.1.0 target edited into a 0.2.0 workspace (index marker) must still reject legacy")
 	}
-	// simulate a genuine 0.1.0 workspace
+	// scrubbing index.json is not enough: the entry carries a hash-chained wags_protocol marker
 	writeJSON(t, ws.IndexFile, map[string]interface{}{"protocol_version": "0.1.0", "reviews": map[string]interface{}{}})
+	if ok, _, _ := ws.VerifyReview(rid, nil); ok {
+		t.Fatal("chained wags_protocol marker must still reject legacy")
+	}
+	// genuine 0.1.0 review: entry written while target is 0.1.0 (unmarked), then legacy-stamped
+	_ = os.WriteFile(filepath.Join(revDir, "rev-a.jsonl"), nil, 0644)
+	e, _ = ws.SubmitEntry(rid, "rev-a", "review", []Finding{{ID: "x", Severity: "P2", Finding: "<b> & c"}}, "approve", "")
+	if _, marked := e.Metadata["wags_protocol"]; marked {
+		t.Fatal("0.1.0 targets must not get the marker")
+	}
+	legacy, _ = computeSHA256OfPayload(entryPayload(e), true)
+	e.EntryHash = legacy
+	b, _ = json.Marshal(e)
+	_ = os.WriteFile(filepath.Join(revDir, "rev-a.jsonl"), append(b, '\n'), 0644)
 	if ok, errs, _ := ws.VerifyReview(rid, nil); !ok {
 		t.Fatalf("legacy hash should verify on 0.1.0 target: %v", errs)
 	}
@@ -448,7 +461,7 @@ func TestGoQuorumAndUnregisteredMessage(t *testing.T) {
 	if c, _ := ws.ConvergeReview(rid); c["overall_verdict"] != "DEFER" || c["quorum_met"] != false {
 		t.Fatalf("quorum: %v", c["overall_verdict"])
 	}
-	if c, _ := ws.ConvergeReviewOpts(rid, 2); c["overall_verdict"] != "APPROVE" {
+	if c, _ := ws.ConvergeReviewOpts(rid, intPtr(2)); c["overall_verdict"] != "APPROVE" {
 		t.Fatalf("min_quorum=2: %v", c["overall_verdict"])
 	}
 	_, _ = ws.SubmitEntry(rid, "zz", "review", nil, "approve", "")
@@ -456,5 +469,90 @@ func TestGoQuorumAndUnregisteredMessage(t *testing.T) {
 	joined := strings.Join(errs, "|")
 	if strings.Contains(joined, "line 0") || !strings.Contains(joined, "has 1 entry but reviewer is not registered") {
 		t.Fatalf("message: %v", errs)
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
+func TestGoMinQuorumValidation(t *testing.T) {
+	for _, bad := range []string{"0", "-1", "1.5", "abc", "true", " 2", "²"} {
+		if _, err := ParseMinQuorum(bad); err == nil {
+			t.Fatalf("CLI value %q should be rejected", bad)
+		}
+	}
+	if v, err := ParseMinQuorum("2"); err != nil || *v != 2 {
+		t.Fatal("2 should parse")
+	}
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	for _, bad := range []int{0, -1, -5} {
+		if _, err := ws.ConvergeReviewOpts(rid, intPtr(bad)); err == nil {
+			t.Fatalf("API min_quorum %d should be rejected", bad)
+		}
+	}
+	c, _ := ws.ConvergeReviewOpts(rid, intPtr(5))
+	q := c["quorum"].(map[string]interface{})
+	if c["overall_verdict"] != "DEFER" || q["warning"] == nil || q["min_quorum"] != 5 {
+		t.Fatalf("above registered: %v %v", c["overall_verdict"], q)
+	}
+}
+
+func TestGoChainedMarkerBlocksScrubbedDowngrade(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	revDir := filepath.Join(ws.ReviewsDir, rid)
+	e, _ := ws.SubmitEntry(rid, "rev-a", "review", nil, "defer", "")
+	if e.Metadata["wags_protocol"] != ProtocolVersion {
+		t.Fatal("new 0.2.0 entries must carry wags_protocol")
+	}
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "defer", "")
+	_, _ = ws.SubmitEntry(rid, "evil", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "evil2", "review", nil, "approve", "")
+	downgrade(t, revDir)
+	writeJSON(t, ws.IndexFile, map[string]interface{}{"protocol_version": "0.1.0", "reviews": map[string]interface{}{}})
+	c, _ := ws.ConvergeReview(rid)
+	if c["overall_verdict"] != "BLOCK" || c["registry_mode"] != "registered" {
+		t.Fatalf("N1: %v %v", c["overall_verdict"], c["registry_mode"])
+	}
+}
+
+func TestGoPresentNoContext(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	c, _ := ws.ConvergeReview(rid)
+	p := filepath.Join(ws.ReviewsDir, rid, "converged.json")
+	delete(c, "anchor_context")
+	writeJSON(t, p, c)
+	c2, _ := ws.ConvergeReview(rid)
+	if c2["anchor_status"] != "present_no_context" || c2["overall_verdict"] != "APPROVE" {
+		t.Fatalf("%v %v", c2["anchor_status"], c2["overall_verdict"])
+	}
+}
+
+func TestGoParallelConverge(t *testing.T) {
+	ws, rid, done := newResWS(t)
+	defer done()
+	_, _ = ws.SubmitEntry(rid, "rev-a", "review", nil, "approve", "")
+	_, _ = ws.SubmitEntry(rid, "rev-b", "review", nil, "approve", "")
+	_, _ = ws.ConvergeReview(rid)
+	res := make(chan string, 32)
+	for i := 0; i < 32; i++ {
+		go func() {
+			c, err := ws.ConvergeReview(rid)
+			if err != nil {
+				res <- "ERR " + err.Error()
+				return
+			}
+			res <- c["overall_verdict"].(string)
+		}()
+	}
+	for i := 0; i < 32; i++ {
+		if v := <-res; v != "APPROVE" {
+			t.Fatalf("parallel converge got %s", v)
+		}
 	}
 }
