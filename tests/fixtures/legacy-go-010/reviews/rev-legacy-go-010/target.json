@@ -1,0 +1,21 @@
+{
+  "created_at": "2026-10-10T00:00:06Z",
+  "current_phase": "review",
+  "initiator": "go010",
+  "phases": [
+    "review",
+    "rebuttal",
+    "meta-review",
+    "convergence"
+  ],
+  "protocol_version": "0.1.0",
+  "review_id": "rev-legacy-go-010",
+  "status": "OPEN",
+  "target": {
+    "description": "legacy",
+    "path": "/tmp/legacyws/t.md",
+    "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    "size_bytes": 1,
+    "type": "doc"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "protocol_version": "0.1.0",
+  "review_id": "rev-govbench-results-001",
+  "created_at": "2026-10-09T21:53:55.804563Z",
+  "initiator": "hugging-face",
+  "target": {
+    "type": "doc",
+    "path": "/workspace/hf-govbench-results/README.md",
+    "sha256": "3251f03f6cdc3579529e683abf6aea232e3901a897f6694fe20a6db5b0e49558",
+    "size_bytes": 7081,
+    "description": "Draft results update for hummbl-hf/governance-bench (fleet results 2026-09-10). NOT published."
+  },
+  "phases": [
+    "review",
+    "rebuttal",
+    "meta-review",
+    "convergence"
+  ],
+  "current_phase": "convergence",
+  "status": "CONVERGED"
+}
