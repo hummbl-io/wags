@@ -102,6 +102,27 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 
+def _read_json(path: Path) -> Any:
+    """Read a JSON file with retry on transient Windows file-lock errors.
+
+    ``_atomic_write_json`` uses ``os.replace``, which on Windows can expose a
+    brief window where a concurrent reader of the same path fails with
+    ``PermissionError`` while the replace is in flight. Mirror the write-side
+    retry so parallel converges don't spuriously fail on the read.
+    """
+    import os
+    import time
+    path = Path(path)
+    for attempt in range(20):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def _compute_sha256(content_bytes: bytes) -> str:
     return hashlib.sha256(content_bytes).hexdigest()
 
@@ -563,13 +584,12 @@ class WagsWorkspace:
         if not conv_file.exists():
             return "absent", {}
         try:
-            with open(conv_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict) or not isinstance(data.get("anchors", {}), dict):
-                return "unparseable", {}
-            return "present", data
+            data = _read_json(conv_file)
         except Exception:
             return "unparseable", {}
+        if not isinstance(data, dict) or not isinstance(data.get("anchors", {}), dict):
+            return "unparseable", {}
+        return "present", data
 
     @classmethod
     def _uses_020_features(cls, rev_dir: Path) -> List[str]:
@@ -615,8 +635,7 @@ class WagsWorkspace:
     @staticmethod
     def _target_protocol(rev_dir: Path) -> str:
         try:
-            with open(rev_dir / "target.json", "r", encoding="utf-8") as f:
-                return str(json.load(f).get("protocol_version", ""))
+            return str(_read_json(rev_dir / "target.json").get("protocol_version", ""))
         except Exception:
             return ""
 
@@ -724,8 +743,7 @@ class WagsWorkspace:
             raise ValueError(f"Review {review_id} not found")
 
         target_file = rev_dir / "target.json"
-        with open(target_file, "r", encoding="utf-8") as f:
-            target_data = json.load(f)
+        target_data = _read_json(target_file)
 
         verification = self.verify_review(review_id, keys)
         registered = self._registered(rev_dir)
