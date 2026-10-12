@@ -1,7 +1,7 @@
 # wags Protocol Specification (v0.2.0)
 
 **Status:** DRAFT / PROPOSED  
-**Author:** Multi-Agent Collective (`devin`, `gemini`, `operator`)  
+**Author:** Multi-Agent Collective (`alice`, `gemini`, `operator`)  
 **Date:** 2026-08-23  
 
 ---
@@ -66,12 +66,12 @@ Each line is a JSON object with cryptographic chaining:
   "sequence": 1,
   "timestamp": "2026-08-23T23:56:10Z",
   "review_id": "rev-20260823-7f8a9b",
-  "reviewer": "devin",
+  "reviewer": "alice",
   "phase": "review",
   "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
   "findings": [
     {
-      "id": "devin-P1-01",
+      "id": "alice-P1-01",
       "severity": "P1",
       "surface": "routing",
       "finding": "Missing boundary check on empty queue input",

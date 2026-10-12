@@ -149,16 +149,16 @@ class TestCrossLanguageCompatibility(unittest.TestCase):
         )
         review_id = rev["review_id"]
 
-        ws.register_reviewer(review_id, "devin")
+        ws.register_reviewer(review_id, "alice")
         ws.register_reviewer(review_id, "gemini")
 
         p2 = Finding(
-            id="devin-P2-01", severity="P2", surface="docs",
+            id="alice-P2-01", severity="P2", surface="docs",
             finding="Add docstring", evidence="shared_spec.md:1",
             recommendation="Add type hint",
         )
         ws.submit_entry(
-            review_id, "devin", phase="review",
+            review_id, "alice", phase="review",
             findings=[p2], verdict="approve",
         )
         ws.submit_entry(review_id, "gemini", phase="review", verdict="approve")

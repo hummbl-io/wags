@@ -40,15 +40,15 @@ rev = ws.init_review(
     target_path="spec.md",
     target_type="doc",
     description="v1.2 specification review",
-    initiator="devin",
+    initiator="alice",
     review_id="rev-spec-001",
 )
 review_id = rev["review_id"]
 
-ws.register_reviewer(review_id, "devin")
+ws.register_reviewer(review_id, "alice")
 ws.submit_entry(
-    review_id, "devin", phase="review",
-    findings=[Finding("devin-P2-01", "P2", "docs",
+    review_id, "alice", phase="review",
+    findings=[Finding("alice-P2-01", "P2", "docs",
                       "Add JSON schema reference",
                       "spec.md:3", "Link to schema")],
     verdict="approve",

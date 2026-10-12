@@ -39,12 +39,12 @@ class TestWagsEngine(unittest.TestCase):
         rev = self.workspace.init_review(self.target_file)
         review_id = rev["review_id"]
 
-        self.workspace.register_reviewer(review_id, "devin", secret_key="devin_secret")
+        self.workspace.register_reviewer(review_id, "alice", secret_key="devin_secret")
         self.workspace.register_reviewer(review_id, "codex", secret_key="codex_secret")
 
-        # Entry 1 by Devin
+        # Entry 1 by alice
         f1 = Finding(
-            id="devin-P1-01",
+            id="alice-P1-01",
             severity="P1",
             surface="queue_safety",
             finding="items.pop() raises IndexError on empty list",
@@ -53,7 +53,7 @@ class TestWagsEngine(unittest.TestCase):
         )
         e1 = self.workspace.submit_entry(
             review_id=review_id,
-            reviewer_name="devin",
+            reviewer_name="alice",
             phase="review",
             findings=[f1],
             verdict="request_changes",
@@ -64,10 +64,10 @@ class TestWagsEngine(unittest.TestCase):
         self.assertTrue(len(e1.entry_hash) == 64)
         self.assertTrue(len(e1.signature) == 64)
 
-        # Entry 2 by Devin (rebuttal/update)
+        # Entry 2 by alice (rebuttal/update)
         e2 = self.workspace.submit_entry(
             review_id=review_id,
-            reviewer_name="devin",
+            reviewer_name="alice",
             phase="meta-review",
             verdict="approve",
             secret_key="devin_secret",
@@ -76,20 +76,20 @@ class TestWagsEngine(unittest.TestCase):
         self.assertEqual(e2.prev_hash, e1.entry_hash)
 
         # Verify integrity
-        ver = self.workspace.verify_review(review_id, keys={"devin": "devin_secret", "codex": "codex_secret"})
+        ver = self.workspace.verify_review(review_id, keys={"alice": "devin_secret", "codex": "codex_secret"})
         self.assertTrue(ver["valid"])
-        self.assertTrue(ver["streams"]["devin"]["valid"])
+        self.assertTrue(ver["streams"]["alice"]["valid"])
 
     def test_tamper_detection(self):
         rev = self.workspace.init_review(self.target_file)
         review_id = rev["review_id"]
 
-        self.workspace.register_reviewer(review_id, "devin")
-        self.workspace.submit_entry(review_id, "devin", phase="review", verdict="approve")
-        self.workspace.submit_entry(review_id, "devin", phase="convergence", verdict="approve")
+        self.workspace.register_reviewer(review_id, "alice")
+        self.workspace.submit_entry(review_id, "alice", phase="review", verdict="approve")
+        self.workspace.submit_entry(review_id, "alice", phase="convergence", verdict="approve")
 
-        # Mutate the first line in devin.jsonl
-        stream_file = Path(self.temp_dir) / "reviews" / review_id / "devin.jsonl"
+        # Mutate the first line in alice.jsonl
+        stream_file = Path(self.temp_dir) / "reviews" / review_id / "alice.jsonl"
         lines = stream_file.read_text(encoding="utf-8").splitlines()
         tampered_entry = json.loads(lines[0])
         tampered_entry["verdict"] = "block"  # maliciously altered
@@ -99,18 +99,18 @@ class TestWagsEngine(unittest.TestCase):
         # Verify must fail
         ver = self.workspace.verify_review(review_id)
         self.assertFalse(ver["valid"])
-        self.assertFalse(ver["streams"]["devin"]["valid"])
+        self.assertFalse(ver["streams"]["alice"]["valid"])
 
     def test_consensus_p0_veto(self):
         rev = self.workspace.init_review(self.target_file)
         review_id = rev["review_id"]
 
-        self.workspace.register_reviewer(review_id, "devin")
+        self.workspace.register_reviewer(review_id, "alice")
         self.workspace.register_reviewer(review_id, "codex")
         self.workspace.register_reviewer(review_id, "gemini")
 
-        # Devin approves
-        self.workspace.submit_entry(review_id, "devin", phase="review", verdict="approve")
+        # alice approves
+        self.workspace.submit_entry(review_id, "alice", phase="review", verdict="approve")
 
         # Gemini approves
         self.workspace.submit_entry(review_id, "gemini", phase="review", verdict="approve")
@@ -141,19 +141,19 @@ class TestWagsEngine(unittest.TestCase):
         rev = self.workspace.init_review(self.target_file)
         review_id = rev["review_id"]
 
-        self.workspace.register_reviewer(review_id, "devin")
+        self.workspace.register_reviewer(review_id, "alice")
         self.workspace.register_reviewer(review_id, "gemini")
 
-        # Devin submits a minor P2 polish note and approves
+        # alice submits a minor P2 polish note and approves
         p2_finding = Finding(
-            id="devin-P2-01",
+            id="alice-P2-01",
             severity="P2",
             surface="docs",
             finding="Add docstring for return type",
             evidence="sample_module.py:1",
             recommendation="Add -> Any type hint",
         )
-        self.workspace.submit_entry(review_id, "devin", phase="review", findings=[p2_finding], verdict="approve")
+        self.workspace.submit_entry(review_id, "alice", phase="review", findings=[p2_finding], verdict="approve")
         self.workspace.submit_entry(review_id, "gemini", phase="review", verdict="approve")
 
         conv = self.workspace.converge_review(review_id)

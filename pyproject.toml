@@ -11,7 +11,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [
-    {name = "Reuben Bowlby", email = "reuben@hummbl.io"},
+    {name = "HUMMBL, LLC", email = "hello@hummbl.io"},
     {name = "HUMMBL, LLC"},
 ]
 classifiers = [
