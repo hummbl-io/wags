@@ -5,10 +5,10 @@
   "initiator": "hugging-face",
   "target": {
     "type": "doc",
-    "path": "/workspace/hf-govbench-results/README.md",
+    "path": "docs/README.md",
     "sha256": "3251f03f6cdc3579529e683abf6aea232e3901a897f6694fe20a6db5b0e49558",
     "size_bytes": 7081,
-    "description": "Draft results update for hummbl-hf/governance-bench (fleet results 2026-09-10). NOT published."
+    "description": "Sample review target for the wags test suite."
   },
   "phases": [
     "review",
