@@ -32,20 +32,20 @@ func TestGoWagsEngine(t *testing.T) {
 	reviewID := manifest["review_id"].(string)
 
 	// Register reviewer
-	if err := ws.RegisterReviewer(reviewID, "devin-go", "secret123", "reviewer"); err != nil {
+	if err := ws.RegisterReviewer(reviewID, "alice-go", "secret123", "reviewer"); err != nil {
 		t.Fatalf("RegisterReviewer failed: %v", err)
 	}
 
 	// Submit P2 finding & approve
 	finding := Finding{
-		ID:             "devin-go-P2-01",
+		ID:             "alice-go-P2-01",
 		Severity:       "P2",
 		Surface:        "core",
 		Finding:        "Add context parameter to Run()",
 		Evidence:       "service.go:3",
 		Recommendation: "Use ctx context.Context",
 	}
-	entry, err := ws.SubmitEntry(reviewID, "devin-go", "review", []Finding{finding}, "approve", "secret123")
+	entry, err := ws.SubmitEntry(reviewID, "alice-go", "review", []Finding{finding}, "approve", "secret123")
 	if err != nil {
 		t.Fatalf("SubmitEntry failed: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestGoWagsEngine(t *testing.T) {
 	}
 
 	// Verify integrity
-	valid, errorsList, err := ws.VerifyReview(reviewID, map[string]string{"devin-go": "secret123"})
+	valid, errorsList, err := ws.VerifyReview(reviewID, map[string]string{"alice-go": "secret123"})
 	if err != nil || !valid {
 		t.Fatalf("VerifyReview failed: %v, errors: %v", err, errorsList)
 	}

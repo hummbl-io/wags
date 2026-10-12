@@ -11,9 +11,9 @@ on:
 jobs:
   analyze:
     name: Analyze
-    # GitHub-hosted compute unavailable for private org; fleet policy
-    # is self-hosted Linux.
-    runs-on: [self-hosted, Linux]
+    # GitHub-hosted runner required for public repos: self-hosted + pull_request
+    # would let fork PRs execute on fleet hardware (repository-publication-flip.md).
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
