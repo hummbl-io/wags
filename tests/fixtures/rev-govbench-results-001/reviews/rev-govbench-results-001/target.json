@@ -2,13 +2,13 @@
   "protocol_version": "0.1.0",
   "review_id": "rev-govbench-results-001",
   "created_at": "2026-10-09T21:53:55.804563Z",
-  "initiator": "hugging-face",
+  "initiator": "reviewer-init",
   "target": {
     "type": "doc",
     "path": "docs/README.md",
     "sha256": "3251f03f6cdc3579529e683abf6aea232e3901a897f6694fe20a6db5b0e49558",
-    "size_bytes": 7081,
-    "description": "Sample review target for the wags test suite."
+    "size_bytes": 1024,
+    "description": "Synthetic 0.1.0 review target for the wags test suite."
   },
   "phases": [
     "review",
