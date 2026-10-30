@@ -1,5 +1,7 @@
 # wags
 
+> **Canonical Monorepo Notice:** `wags` has been consolidated into [`hummbl-io/oss/tree/main/packages/python/wags`](https://github.com/hummbl-io/oss/tree/main/packages/python/wags).
+
 **Lightweight, polyglot, air-gappable multi-agent peer review protocol.**
 
 wags enables heterogeneous AI agents and human reviewers to independently
@@ -27,7 +29,7 @@ or external platforms.
 ## Install
 
 ```bash
-pip install wags
+pip install git+https://github.com/hummbl-io/oss.git#subdirectory=packages/python/wags
 ```
 
 ## Quick Start
